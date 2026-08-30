@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- stilisierter Rauchmelder mit Schallwellen -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,36 a14,14 0 1,0 0.001,0 Z M54,42 a8,8 0 1,1 -0.001,0 Z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M51,47 h6 v6 h-6 Z" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:pathData="M40,64 q14,10 28,0" />
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:fillColor="#00000000"
+        android:pathData="M36,71 q18,13 36,0" />
+</vector>

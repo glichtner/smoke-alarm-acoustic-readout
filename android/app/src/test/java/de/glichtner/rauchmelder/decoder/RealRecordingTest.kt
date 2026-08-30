@@ -1,0 +1,64 @@
+package de.glichtner.rauchmelder.decoder
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assume.assumeTrue
+import org.junit.Test
+import java.io.File
+
+/**
+ * Decodes Ei650i recordings when they are available as 48 kHz mono PCM WAV
+ * (`audiolink-1.wav`, `audiolink-2.wav`) under the path from the
+ * RAUCHMELDER_WAV_DIR environment variable; skipped otherwise.
+ */
+class RealRecordingTest {
+
+    private fun loadWav(file: File): Pair<FloatArray, Int> = WavFiles.load(file)
+
+    private fun decode(fileName: String): AudioLinkDecoder.DecodeResult? {
+        val dir = System.getenv("RAUCHMELDER_WAV_DIR")
+        assumeTrue("RAUCHMELDER_WAV_DIR not set", dir != null)
+        val file = File(dir!!, fileName)
+        assumeTrue("$file missing", file.isFile)
+        val (samples, sampleRate) = loadWav(file)
+        return AudioLinkDecoder.decode(samples, sampleRate)
+    }
+
+    @Test
+    fun recording1() {
+        val result = decode("audiolink-1.wav")
+        assertNotNull(result)
+        assertEquals("012549f4", result!!.fields.alarmId)
+        assertEquals("Ei650i", result.fields.model)
+        assertEquals(3.04, result.fields.batteryVoltage, 1e-9)
+        assertEquals(1, result.fields.removal.count)
+    }
+
+    /** Recording with in-band noise prepended. */
+    @Test
+    fun recording1AfterNoise() {
+        val dir = System.getenv("RAUCHMELDER_WAV_DIR")
+        assumeTrue("RAUCHMELDER_WAV_DIR not set", dir != null)
+        val file = File(dir!!, "audiolink-1.wav")
+        assumeTrue("$file missing", file.isFile)
+        val (recording, sampleRate) = loadWav(file)
+        val random = java.util.Random(3)
+        val pre = FloatArray(4 * sampleRate) {
+            (random.nextGaussian() * 0.08 +
+                0.3 * kotlin.math.sin(2.0 * Math.PI * 6800.0 * it / sampleRate)).toFloat()
+        }
+        val samples = pre + recording
+        val result = AudioLinkDecoder.decode(samples, sampleRate)
+        assertNotNull("frame behind noise not decoded", result)
+        assertEquals("012549f4", result!!.fields.alarmId)
+    }
+
+    @Test
+    fun recording2() {
+        val result = decode("audiolink-2.wav")
+        assertNotNull(result)
+        assertEquals("012549ef", result!!.fields.alarmId)
+        assertEquals(0, result.fields.testButton.count)
+        assertEquals("2025-09-15", result.fields.manufactureDate)
+    }
+}

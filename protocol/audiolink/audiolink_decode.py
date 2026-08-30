@@ -1,0 +1,533 @@
+#!/usr/bin/env python3
+"""Reference decoder for the Ei Electronics AudioLINK+ status frame.
+
+Implements the receiver described in PROTOCOL.md (binary energy FSK at
+5.5/6.8 kHz, 100 bit/s, 41 wire bytes, CRC-16/CCITT-FALSE) using only the
+Python standard library plus NumPy.  PCM WAV files are read directly; other
+formats are converted to a temporary WAV file with GStreamer.  The legacy
+20 bit/s Manchester AudioLINK variant is not decoded.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+import wave
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+
+
+FRAME_BYTES = 41
+FRAME_BITS = FRAME_BYTES * 8
+BLOCK_MARKER = 0x72
+END_MARKER = 0xAA
+MARKER_BYTE_OFFSETS = (2, 9, 16, 23, 30, 37)
+PAYLOAD_LENGTH = 30
+TIME_COUNTER_EPOCH = 24090
+
+
+class DecodeError(RuntimeError):
+    """Raised when no checksum-valid AudioLINK+ frame is found."""
+
+
+@dataclass
+class Candidate:
+    start_sample: float
+    period_samples: float
+    features: np.ndarray
+    bits: np.ndarray
+    wire: bytes
+    fixed_score: int
+    fixed_total: int
+    low_level: float
+    high_level: float
+    crc_valid: bool
+
+    @property
+    def separation(self) -> float:
+        spread = max(abs(self.high_level), abs(self.low_level), 1e-12)
+        return (self.high_level - self.low_level) / spread
+
+
+def _read_pcm_wav(path: Path) -> tuple[np.ndarray, int]:
+    with wave.open(str(path), "rb") as wav:
+        channels = wav.getnchannels()
+        sample_width = wav.getsampwidth()
+        sample_rate = wav.getframerate()
+        frame_count = wav.getnframes()
+        raw = wav.readframes(frame_count)
+
+    if sample_width == 1:
+        samples = (np.frombuffer(raw, dtype=np.uint8).astype(np.float64) - 128.0) / 128.0
+    elif sample_width == 2:
+        samples = np.frombuffer(raw, dtype="<i2").astype(np.float64) / 32768.0
+    elif sample_width == 3:
+        packed = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 3)
+        values = (
+            packed[:, 0].astype(np.int32)
+            | (packed[:, 1].astype(np.int32) << 8)
+            | (packed[:, 2].astype(np.int32) << 16)
+        )
+        values = (values ^ 0x800000) - 0x800000
+        samples = values.astype(np.float64) / 8388608.0
+    elif sample_width == 4:
+        samples = np.frombuffer(raw, dtype="<i4").astype(np.float64) / 2147483648.0
+    else:
+        raise DecodeError(f"unsupported WAV sample width: {sample_width} bytes")
+
+    if channels > 1:
+        samples = samples.reshape(-1, channels).mean(axis=1)
+    return samples, sample_rate
+
+
+def load_audio(path: Path) -> tuple[np.ndarray, int]:
+    """Load PCM WAV directly or ask GStreamer to decode a compressed file."""
+    try:
+        return _read_pcm_wav(path)
+    except (wave.Error, EOFError):
+        pass
+
+    gst = shutil.which("gst-launch-1.0")
+    if gst is None:
+        raise DecodeError(
+            f"{path} is not a supported PCM WAV and gst-launch-1.0 is unavailable; "
+            "install GStreamer or convert the file to mono PCM WAV first"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="audiolink-") as temp_dir:
+        decoded = Path(temp_dir) / "decoded.wav"
+        command = [
+            gst,
+            "-q",
+            "filesrc",
+            f"location={path.resolve()}",
+            "!",
+            "decodebin",
+            "!",
+            "audioconvert",
+            "!",
+            "audioresample",
+            "!",
+            "audio/x-raw,format=S16LE,channels=1,rate=48000",
+            "!",
+            "wavenc",
+            "!",
+            "filesink",
+            f"location={decoded}",
+        ]
+        result = subprocess.run(command, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "unknown GStreamer error"
+            raise DecodeError(f"could not decode {path}: {detail}")
+        return _read_pcm_wav(decoded)
+
+
+def fsk_envelopes(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return analytic-envelope magnitudes around 5.5 and 6.8 kHz."""
+    spectrum = np.fft.fft(samples)
+    frequencies = np.fft.fftfreq(len(samples), 1.0 / sample_rate)
+    envelopes: list[np.ndarray] = []
+    for low, high in ((5250.0, 5750.0), (6550.0, 7050.0)):
+        keep = (frequencies >= low) & (frequencies <= high)
+        analytic = np.fft.ifft(spectrum * (2.0 * keep))
+        envelopes.append(np.abs(analytic))
+    return envelopes[0], envelopes[1]
+
+
+def crc_ccitt_false(data: bytes) -> int:
+    """CRC-16/CCITT-FALSE: poly 0x1021, init 0xffff, no reflection/xorout."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def bits_to_bytes(bits: np.ndarray) -> bytes:
+    if len(bits) % 8:
+        raise ValueError("bit count is not byte-aligned")
+    return np.packbits(bits.astype(np.uint8), bitorder="big").tobytes()
+
+
+def wire_to_payload(wire: bytes) -> bytes:
+    if len(wire) != FRAME_BYTES:
+        raise ValueError(f"wire frame must contain {FRAME_BYTES} bytes")
+    chunks = [wire[offset + 1 : offset + 7] for offset in MARKER_BYTE_OFFSETS[:5]]
+    payload = b"".join(chunks)
+    if len(payload) != PAYLOAD_LENGTH:
+        raise AssertionError("internal payload framing error")
+    return payload
+
+
+def wire_is_structurally_valid(wire: bytes) -> bool:
+    return (
+        len(wire) == FRAME_BYTES
+        and wire[:2] == b"\x00\x00"
+        and all(wire[offset] == BLOCK_MARKER for offset in MARKER_BYTE_OFFSETS)
+        and wire[-1] == END_MARKER
+    )
+
+
+def wire_crc_valid(wire: bytes) -> bool:
+    if not wire_is_structurally_valid(wire):
+        return False
+    payload = wire_to_payload(wire)
+    received = int.from_bytes(wire[38:40], "big")
+    return crc_ccitt_false(payload) == received
+
+
+def canonical_frame(wire: bytes) -> bytes:
+    """Return the canonical 34-byte buffer: AA + payload + CRC + AA."""
+    return b"\xaa" + wire_to_payload(wire) + wire[38:40] + b"\xaa"
+
+
+def _fixed_frame_bits() -> tuple[np.ndarray, np.ndarray]:
+    positions: list[int] = []
+    values: list[int] = []
+    fixed_bytes = {0: 0x00, 1: 0x00, 40: END_MARKER}
+    fixed_bytes.update({offset: BLOCK_MARKER for offset in MARKER_BYTE_OFFSETS})
+    for byte_offset, value in fixed_bytes.items():
+        for bit_offset in range(8):
+            positions.append(byte_offset * 8 + bit_offset)
+            values.append((value >> (7 - bit_offset)) & 1)
+    return np.asarray(positions), np.asarray(values, dtype=np.uint8)
+
+
+FIXED_POSITIONS, FIXED_VALUES = _fixed_frame_bits()
+
+
+def _row_kmeans(features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Two-means per row; 5.5-kHz-dominant/high discriminator is one."""
+    if features.ndim == 1:
+        features = features[None, :]
+    low = np.percentile(features, 25, axis=1)
+    high = np.percentile(features, 75, axis=1)
+    for _ in range(12):
+        threshold = (low + high) / 2.0
+        low_mask = features <= threshold[:, None]
+        low_count = np.maximum(low_mask.sum(axis=1), 1)
+        high_count = np.maximum((~low_mask).sum(axis=1), 1)
+        new_low = (features * low_mask).sum(axis=1) / low_count
+        new_high = (features * (~low_mask)).sum(axis=1) / high_count
+        if np.allclose(low, new_low, rtol=0.0, atol=1e-12) and np.allclose(
+            high, new_high, rtol=0.0, atol=1e-12
+        ):
+            break
+        low, high = new_low, new_high
+    bits = features >= ((low + high) / 2.0)[:, None]
+    return bits.astype(np.uint8), low, high
+
+
+def _active_region_start(envelope: np.ndarray, sample_rate: int) -> int:
+    block_samples = max(1, round(sample_rate * 0.050))
+    block_count = len(envelope) // block_samples
+    if block_count == 0:
+        raise DecodeError("audio is too short to contain an AudioLINK+ frame")
+    levels = envelope[: block_count * block_samples].reshape(block_count, block_samples).mean(axis=1)
+    threshold = max(float(np.percentile(levels, 95)) * 0.25, float(np.percentile(levels, 25)) * 4.0)
+    active = levels > threshold
+    edges = np.flatnonzero(np.diff(np.r_[False, active, False])).reshape(-1, 2)
+    long_runs = [(start, end) for start, end in edges if (end - start) * 0.050 >= 2.5]
+    if not long_runs:
+        raise DecodeError("no approximately 3.3-second AudioLINK+ data region found")
+    start, _ = max(long_runs, key=lambda pair: pair[1] - pair[0])
+    return start * block_samples
+
+
+def _evaluate_rows(
+    discriminator_sum: np.ndarray,
+    starts: np.ndarray,
+    period_samples: float,
+) -> list[Candidate]:
+    symbol_numbers = np.arange(FRAME_BITS, dtype=np.float64)
+    symbol_starts = starts[:, None] + period_samples * symbol_numbers
+    # Ignore the transition-prone outer 13.75 percent on each side.
+    first = np.rint(symbol_starts + period_samples * 0.1375).astype(np.int64)
+    last = np.rint(symbol_starts + period_samples * 0.8625).astype(np.int64)
+    valid = (first[:, 0] >= 0) & (last[:, -1] < len(discriminator_sum))
+    if not np.any(valid):
+        return []
+    starts = starts[valid]
+    first = first[valid]
+    last = last[valid]
+    features = (discriminator_sum[last] - discriminator_sum[first]) / np.maximum(last - first, 1)
+    bits, low, high = _row_kmeans(features)
+    fixed_scores = (bits[:, FIXED_POSITIONS] == FIXED_VALUES).sum(axis=1)
+
+    results: list[Candidate] = []
+    for row in range(len(starts)):
+        wire = bits_to_bytes(bits[row])
+        results.append(
+            Candidate(
+                start_sample=float(starts[row]),
+                period_samples=float(period_samples),
+                features=features[row],
+                bits=bits[row],
+                wire=wire,
+                fixed_score=int(fixed_scores[row]),
+                fixed_total=len(FIXED_POSITIONS),
+                low_level=float(low[row]),
+                high_level=float(high[row]),
+                crc_valid=wire_crc_valid(wire),
+            )
+        )
+    return results
+
+
+def find_frame(low_envelope: np.ndarray, high_envelope: np.ndarray, sample_rate: int) -> Candidate:
+    total_energy = low_envelope + high_envelope
+    approximate_start = _active_region_start(total_energy, sample_rate)
+    noise_floor = max(float(np.percentile(total_energy, 25)) * 2.0, 1e-12)
+    discriminator = (low_envelope - high_envelope) / (total_energy + noise_floor)
+    discriminator_sum = np.r_[0.0, np.cumsum(discriminator)]
+
+    search_start = max(0, approximate_start - round(0.075 * sample_rate))
+    search_end = min(
+        len(total_energy) - round(FRAME_BITS * 0.0096 * sample_rate) - 1,
+        approximate_start + round(0.150 * sample_rate),
+    )
+    coarse_starts = np.arange(search_start, search_end, max(1, round(sample_rate * 0.000125)))
+    coarse_periods = np.arange(sample_rate * 0.00970, sample_rate * 0.01030 + 0.001, 0.50)
+
+    coarse: list[Candidate] = []
+    for period in coarse_periods:
+        rows = _evaluate_rows(discriminator_sum, coarse_starts, float(period))
+        rows.sort(key=lambda item: (item.fixed_score, item.separation), reverse=True)
+        coarse.extend(rows[:3])
+    coarse.sort(key=lambda item: (item.crc_valid, item.fixed_score, item.separation), reverse=True)
+    if not coarse:
+        raise DecodeError("could not construct any AudioLINK+ frame candidates")
+
+    refined: list[Candidate] = []
+    seen: set[tuple[int, int]] = set()
+    for seed in coarse[:16]:
+        for period in np.arange(seed.period_samples - 0.65, seed.period_samples + 0.651, 0.025):
+            starts = np.arange(round(seed.start_sample) - 12, round(seed.start_sample) + 13, 1)
+            for candidate in _evaluate_rows(discriminator_sum, starts, float(period)):
+                key = (round(candidate.start_sample), round(candidate.period_samples * 1000))
+                if key not in seen:
+                    seen.add(key)
+                    refined.append(candidate)
+
+    refined.sort(key=lambda item: (item.crc_valid, item.fixed_score, item.separation), reverse=True)
+    best = refined[0] if refined else coarse[0]
+    if not best.crc_valid:
+        raise DecodeError(
+            "an AudioLINK+-like clock was found, but no checksum-valid frame could be reconstructed "
+            f"(best framing score {best.fixed_score}/{best.fixed_total})"
+        )
+    return best
+
+
+def _counter_age(counter: int, count: int, current_counter: int) -> dict[str, int | None]:
+    if count <= 0:
+        return {"counter_raw": counter, "age_hours": None, "age_days": None}
+    hours = (counter - current_counter) * 4
+    return {"counter_raw": counter, "age_hours": hours, "age_days": hours // 24}
+
+
+def _event(
+    payload: bytes,
+    offset: int,
+    current_counter: int,
+    *,
+    removal_bias: bool = False,
+) -> dict[str, int | None]:
+    counter = int.from_bytes(payload[offset : offset + 2], "big")
+    raw_count = payload[offset + 2]
+    count = max(0, raw_count - 1) if removal_bias else raw_count
+    result: dict[str, int | None] = {"count": count, "count_raw": raw_count}
+    result.update(_counter_age(counter, count, current_counter))
+    return result
+
+
+def _battery_voltage(nibble: int) -> float:
+    values = (2.35, 2.38, 2.42, 2.46, 2.50, 2.54, 2.58, 2.63,
+              2.67, 2.72, 2.77, 2.82, 2.87, 2.92, 2.98, 3.04)
+    return values[nibble]
+
+
+def _manufacture_date(payload: bytes) -> str:
+    first, second = payload[27:29]
+    day = first >> 3
+    month = ((first & 0x07) << 1) | (second >> 7)
+    year = 1980 + (second & 0x7F)
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def decode_fields(payload: bytes) -> dict[str, Any]:
+    if len(payload) != PAYLOAD_LENGTH:
+        raise ValueError(f"payload must contain exactly {PAYLOAD_LENGTH} bytes")
+    uptime_counter = int.from_bytes(payload[0:2], "big")
+    uptime_hours = (TIME_COUNTER_EPOCH - uptime_counter) * 4
+    type_code = payload[2]
+    contamination_raw = payload[3] & 0x3F
+    status = payload[4]
+    battery_code = status & 0x0F
+    alarm_id = payload[23:27].hex()
+    manufacture_month = ((payload[27] & 0x07) << 1) | (payload[28] >> 7)
+    manufacture_year = 1980 + (payload[28] & 0x7F)
+
+    return {
+        "model": {1: "Ei650", 2: "Ei650i"}.get(type_code, f"unknown ({type_code})"),
+        "model_code": type_code,
+        "uptime_counter_raw": uptime_counter,
+        "uptime_hours": uptime_hours,
+        "uptime_days": uptime_hours // 24,
+        "contamination_raw": contamination_raw,
+        "contamination_level": round(min(contamination_raw / 3.2, 10.0), 1)
+        if contamination_raw <= 32 and not bool(status & 0x20)
+        else None,
+        "contamination_valid": contamination_raw <= 32 and not bool(status & 0x20),
+        "dust_calculating": bool(status & 0x20),
+        "sensor_ok": not bool(status & 0x80),
+        "status_raw": status,
+        "battery_code": battery_code,
+        "battery_voltage_v": _battery_voltage(battery_code),
+        "battery_status": "green" if battery_code > 8 else ("amber" if battery_code >= 4 else "red"),
+        "test_button": _event(payload, 5, uptime_counter),
+        "smoke_alarm": _event(payload, 8, uptime_counter),
+        "reserved_event_bytes_11_16": payload[11:17].hex(),
+        "low_battery": _event(payload, 17, uptime_counter),
+        "removal": _event(payload, 20, uptime_counter, removal_bias=True),
+        "alarm_id": alarm_id,
+        "date_code_raw": payload[27:29].hex(),
+        "manufacture_date": _manufacture_date(payload),
+        "replacement_month": f"{manufacture_year + 11:04d}-{manufacture_month:02d}",
+        "reserved_byte_29": payload[29],
+    }
+
+
+def estimate_fsk_frequencies(
+    samples: np.ndarray,
+    candidate: Candidate,
+    sample_rate: int,
+) -> dict[str, float]:
+    fft_size = 8192
+    frequencies = np.fft.rfftfreq(fft_size, 1.0 / sample_rate)
+    estimates: dict[str, float] = {}
+    for bit, low, high in ((1, 5000.0, 6000.0), (0, 6300.0, 7300.0)):
+        power = np.zeros(fft_size // 2 + 1)
+        for symbol in np.flatnonzero(candidate.bits == bit):
+            base = candidate.start_sample + symbol * candidate.period_samples
+            first = round(base + 0.1375 * candidate.period_samples)
+            last = round(base + 0.8625 * candidate.period_samples)
+            segment = samples[first:last]
+            if len(segment) < 2:
+                continue
+            power += np.abs(np.fft.rfft(segment * np.hanning(len(segment)), fft_size)) ** 2
+        band = np.flatnonzero((frequencies >= low) & (frequencies <= high))
+        estimates[f"logical_{bit}_hz"] = float(frequencies[band[np.argmax(power[band])]])
+    return estimates
+
+
+def decode_file(path: Path) -> dict[str, Any]:
+    samples, sample_rate = load_audio(path)
+    if len(samples) < round(sample_rate * 3.0):
+        raise DecodeError("audio is too short to contain the 3.28-second frame")
+    if sample_rate < 15000:
+        raise DecodeError("sample rate is too low for the 6.8-kHz FSK band")
+    low_envelope, high_envelope = fsk_envelopes(samples, sample_rate)
+    candidate = find_frame(low_envelope, high_envelope, sample_rate)
+    payload = wire_to_payload(candidate.wire)
+    received_crc = int.from_bytes(candidate.wire[38:40], "big")
+
+    return {
+        "file": str(path),
+        "sample_rate_hz": sample_rate,
+        "duration_s": len(samples) / sample_rate,
+        "protocol": "AudioLINK+ (version 2)",
+        "fsk_tones": estimate_fsk_frequencies(samples, candidate, sample_rate),
+        "nominal_symbol_period_ms": 10.0,
+        "nominal_bit_rate_bps": 100.0,
+        "symbol_period_fit_ms": candidate.period_samples / sample_rate * 1000.0,
+        "bit_rate_fit_bps": sample_rate / candidate.period_samples,
+        "frame_start_s": candidate.start_sample / sample_rate,
+        "physical_bits_msb_first": "".join(str(int(bit)) for bit in candidate.bits),
+        "wire_bytes_hex": candidate.wire.hex(" "),
+        "canonical_bytes_hex": canonical_frame(candidate.wire).hex(" "),
+        "payload_hex": payload.hex(" "),
+        "crc": {
+            "algorithm": "CRC-16/CCITT-FALSE",
+            "received_hex": f"{received_crc:04x}",
+            "calculated_hex": f"{crc_ccitt_false(payload):04x}",
+            "valid": True,
+        },
+        "framing_score": f"{candidate.fixed_score}/{candidate.fixed_total}",
+        "symbol_levels": {
+            "logical_0_discriminator_center": candidate.low_level,
+            "logical_1_discriminator_center": candidate.high_level,
+            "center_separation": candidate.high_level - candidate.low_level,
+        },
+        "fields": decode_fields(payload),
+    }
+
+
+def _human_output(result: dict[str, Any]) -> str:
+    fields = result["fields"]
+    crc = result["crc"]
+    contamination = (
+        "unavailable"
+        if fields["contamination_level"] is None
+        else f"{fields['contamination_level']:.5g}"
+    )
+    lines = [
+        f"File: {result['file']}",
+        f"Protocol: {result['protocol']}",
+        f"Audio: {result['sample_rate_hz']} Hz, {result['duration_s']:.4f} s",
+        f"FSK tones: 1={result['fsk_tones']['logical_1_hz']:.1f} Hz, 0={result['fsk_tones']['logical_0_hz']:.1f} Hz",
+        "Symbol clock: nominal 10 ms / 100 bit/s "
+        f"(search fit {result['symbol_period_fit_ms']:.3f} ms / {result['bit_rate_fit_bps']:.2f} bit/s)",
+        f"Frame start: {result['frame_start_s']:.6f} s",
+        f"Wire bytes:      {result['wire_bytes_hex']}",
+        f"Canonical bytes: {result['canonical_bytes_hex']}",
+        f"Payload:         {result['payload_hex']}",
+        f"CRC: received {crc['received_hex']}, calculated {crc['calculated_hex']} ({'OK' if crc['valid'] else 'FAIL'})",
+        f"Model: {fields['model']}",
+        f"Alarm ID: {fields['alarm_id']}",
+        f"Uptime: {fields['uptime_hours']} h ({fields['uptime_days']} days)",
+        f"Battery: {fields['battery_voltage_v']:.2f} V (code {fields['battery_code']})",
+        f"Sensor: {'OK' if fields['sensor_ok'] else 'failure'}",
+        f"Contamination: {contamination} (raw {fields['contamination_raw']})",
+        f"Test button: {fields['test_button']['count']} event(s), age days {fields['test_button']['age_days']}",
+        f"Smoke alarm: {fields['smoke_alarm']['count']} event(s), age days {fields['smoke_alarm']['age_days']}",
+        f"Low battery: {fields['low_battery']['count']} event(s), age days {fields['low_battery']['age_days']}",
+        f"Removal: {fields['removal']['count']} event(s), age days {fields['removal']['age_days']}",
+        f"Manufactured: {fields['manufacture_date']} (raw {fields['date_code_raw']})",
+        f"Replace by: {fields['replacement_month']}",
+    ]
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("audio", nargs="+", type=Path, help="PCM WAV or a GStreamer-decodable audio file")
+    parser.add_argument("--json", action="store_true", help="emit machine-readable JSON")
+    args = parser.parse_args(argv)
+
+    results: list[dict[str, Any]] = []
+    failed = False
+    for path in args.audio:
+        try:
+            results.append(decode_file(path))
+        except (DecodeError, OSError) as error:
+            failed = True
+            print(f"{path}: decode failed: {error}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps(results if len(args.audio) > 1 else (results[0] if results else {}), indent=2))
+    else:
+        print("\n\n".join(_human_output(result) for result in results))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
