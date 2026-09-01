@@ -87,46 +87,63 @@ def _read_pcm_wav(path: Path) -> tuple[np.ndarray, int]:
     return samples, sample_rate
 
 
+def _conversion_commands(path: Path, decoded: Path, rate: int) -> list[list[str]]:
+    commands: list[list[str]] = []
+    gst = shutil.which("gst-launch-1.0")
+    if gst is not None:
+        commands.append([
+            gst, "-q",
+            "filesrc", f"location={path.resolve()}",
+            "!", "decodebin", "!", "audioconvert", "!", "audioresample",
+            "!", f"audio/x-raw,format=S16LE,channels=1,rate={rate}",
+            "!", "wavenc", "!", "filesink", f"location={decoded}",
+        ])
+    return commands
+
+
+def _ffmpeg_pcm(path: Path, rate: int) -> np.ndarray | None:
+    """Decode via ffmpeg to raw 16-bit PCM on stdout (no temp file needed,
+    which keeps sandboxed ffmpeg builds working)."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        return None
+    command = [
+        ffmpeg, "-v", "error", "-i", str(path.resolve()),
+        "-ac", "1", "-ar", str(rate), "-f", "s16le", "-",
+    ]
+    result = subprocess.run(command, capture_output=True, check=False)
+    if result.returncode != 0 or len(result.stdout) < 2:
+        return None
+    return np.frombuffer(result.stdout, dtype="<i2").astype(np.float64) / 32768.0
+
+
+def convert_to_wav(path: Path, rate: int) -> tuple[np.ndarray, int]:
+    """Decode a compressed recording via GStreamer or ffmpeg."""
+    errors: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="audiolink-") as temp_dir:
+        decoded = Path(temp_dir) / "decoded.wav"
+        for command in _conversion_commands(path, decoded, rate):
+            result = subprocess.run(command, capture_output=True, text=True, check=False)
+            if result.returncode == 0 and decoded.is_file():
+                return _read_pcm_wav(decoded)
+            errors.append(result.stderr.strip() or result.stdout.strip() or "unknown error")
+            decoded.unlink(missing_ok=True)
+    samples = _ffmpeg_pcm(path, rate)
+    if samples is not None:
+        return samples, rate
+    raise DecodeError(
+        f"could not decode {path}"
+        + ("; install GStreamer or ffmpeg" if not errors else ": " + "; ".join(errors))
+    )
+
+
 def load_audio(path: Path) -> tuple[np.ndarray, int]:
-    """Load PCM WAV directly or ask GStreamer to decode a compressed file."""
+    """Load PCM WAV directly, or decode a compressed file to 48 kHz mono."""
     try:
         return _read_pcm_wav(path)
     except (wave.Error, EOFError):
         pass
-
-    gst = shutil.which("gst-launch-1.0")
-    if gst is None:
-        raise DecodeError(
-            f"{path} is not a supported PCM WAV and gst-launch-1.0 is unavailable; "
-            "install GStreamer or convert the file to mono PCM WAV first"
-        )
-
-    with tempfile.TemporaryDirectory(prefix="audiolink-") as temp_dir:
-        decoded = Path(temp_dir) / "decoded.wav"
-        command = [
-            gst,
-            "-q",
-            "filesrc",
-            f"location={path.resolve()}",
-            "!",
-            "decodebin",
-            "!",
-            "audioconvert",
-            "!",
-            "audioresample",
-            "!",
-            "audio/x-raw,format=S16LE,channels=1,rate=48000",
-            "!",
-            "wavenc",
-            "!",
-            "filesink",
-            f"location={decoded}",
-        ]
-        result = subprocess.run(command, capture_output=True, text=True, check=False)
-        if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "unknown GStreamer error"
-            raise DecodeError(f"could not decode {path}: {detail}")
-        return _read_pcm_wav(decoded)
+    return convert_to_wav(path, 48_000)
 
 
 def fsk_envelopes(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
@@ -203,6 +220,98 @@ def _fixed_frame_bits() -> tuple[np.ndarray, np.ndarray]:
 
 FIXED_POSITIONS, FIXED_VALUES = _fixed_frame_bits()
 
+MARKER_ONE_BITS = (1, 2, 3, 6)   # 0x72 = 01110010
+MARKER_ZERO_BITS = (0, 4, 5, 7)
+END_ONE_BITS = (0, 2, 4, 6)      # 0xAA = 10101010
+END_ZERO_BITS = (1, 3, 5, 7)
+_NON_FIXED_POSITIONS = np.asarray(
+    [index for index in range(FRAME_BITS) if index not in set(int(p) for p in FIXED_POSITIONS)]
+)
+
+
+def _marker_anchored_thresholds(features: np.ndarray) -> np.ndarray:
+    """Per-symbol thresholds anchored at the known marker bits.
+
+    Each 0x72 marker and the closing 0xAA contain four known one and four
+    known zero bits whose feature means give a local decision threshold;
+    values between the anchors are interpolated linearly.  This compensates
+    baseline drift of the discriminator across the frame (e.g. from in-band
+    background noise), which a single global threshold cannot.
+    """
+    xs: list[float] = []
+    ys: list[float] = []
+    for offset in MARKER_BYTE_OFFSETS:
+        block = features[offset * 8 : offset * 8 + 8]
+        xs.append(offset * 8 + 3.5)
+        ys.append((block[list(MARKER_ONE_BITS)].mean() + block[list(MARKER_ZERO_BITS)].mean()) / 2.0)
+    end_block = features[320:328]
+    xs.append(323.5)
+    ys.append((end_block[list(END_ONE_BITS)].mean() + end_block[list(END_ZERO_BITS)].mean()) / 2.0)
+    return np.interp(np.arange(FRAME_BITS, dtype=np.float64), xs, ys)
+
+
+def _confidence_flips(
+    bits: np.ndarray, features: np.ndarray, thresholds: np.ndarray
+) -> tuple[np.ndarray, bytes] | None:
+    """Flip up to two least-confident non-fixed bits to satisfy the CRC.
+
+    Only used when all 72 fixed bits already match; with a few dozen
+    combinations against a 16-bit CRC, false accepts are negligible.
+    """
+    confidence = np.abs(features[_NON_FIXED_POSITIONS] - thresholds[_NON_FIXED_POSITIONS])
+    order = _NON_FIXED_POSITIONS[np.argsort(confidence)]
+    for index in order[:12]:
+        flipped = bits.copy()
+        flipped[index] ^= 1
+        wire = bits_to_bytes(flipped)
+        if wire_crc_valid(wire):
+            return flipped, wire
+    pairs = order[:8]
+    for a in range(len(pairs)):
+        for b in range(a + 1, len(pairs)):
+            flipped = bits.copy()
+            flipped[pairs[a]] ^= 1
+            flipped[pairs[b]] ^= 1
+            wire = bits_to_bytes(flipped)
+            if wire_crc_valid(wire):
+                return flipped, wire
+    return None
+
+
+def _decide(
+    features: np.ndarray,
+    thresholds: np.ndarray,
+    start: float,
+    period: float,
+    low: float,
+    high: float,
+) -> Candidate:
+    bits = (features >= thresholds).astype(np.uint8)
+    wire = bits_to_bytes(bits)
+    fixed_score = int((bits[FIXED_POSITIONS] == FIXED_VALUES).sum())
+    crc_valid = wire_crc_valid(wire)
+    if not crc_valid and fixed_score == len(FIXED_POSITIONS):
+        recovered = _confidence_flips(bits, features, thresholds)
+        if recovered is not None:
+            bits, wire = recovered
+            crc_valid = True
+    return Candidate(
+        start_sample=start,
+        period_samples=period,
+        features=features,
+        bits=bits,
+        wire=wire,
+        fixed_score=fixed_score,
+        fixed_total=len(FIXED_POSITIONS),
+        low_level=low,
+        high_level=high,
+        crc_valid=crc_valid,
+    )
+
+
+def _candidate_key(candidate: Candidate) -> tuple:
+    return (candidate.crc_valid, candidate.fixed_score, candidate.separation)
+
 
 def _row_kmeans(features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Two-means per row; 5.5-kHz-dominant/high discriminator is one."""
@@ -226,22 +335,6 @@ def _row_kmeans(features: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return bits.astype(np.uint8), low, high
 
 
-def _active_region_start(envelope: np.ndarray, sample_rate: int) -> int:
-    block_samples = max(1, round(sample_rate * 0.050))
-    block_count = len(envelope) // block_samples
-    if block_count == 0:
-        raise DecodeError("audio is too short to contain an AudioLINK+ frame")
-    levels = envelope[: block_count * block_samples].reshape(block_count, block_samples).mean(axis=1)
-    threshold = max(float(np.percentile(levels, 95)) * 0.25, float(np.percentile(levels, 25)) * 4.0)
-    active = levels > threshold
-    edges = np.flatnonzero(np.diff(np.r_[False, active, False])).reshape(-1, 2)
-    long_runs = [(start, end) for start, end in edges if (end - start) * 0.050 >= 2.5]
-    if not long_runs:
-        raise DecodeError("no approximately 3.3-second AudioLINK+ data region found")
-    start, _ = max(long_runs, key=lambda pair: pair[1] - pair[0])
-    return start * block_samples
-
-
 def _evaluate_rows(
     discriminator_sum: np.ndarray,
     starts: np.ndarray,
@@ -259,72 +352,108 @@ def _evaluate_rows(
     first = first[valid]
     last = last[valid]
     features = (discriminator_sum[last] - discriminator_sum[first]) / np.maximum(last - first, 1)
-    bits, low, high = _row_kmeans(features)
-    fixed_scores = (bits[:, FIXED_POSITIONS] == FIXED_VALUES).sum(axis=1)
+    _, low, high = _row_kmeans(features)
 
     results: list[Candidate] = []
     for row in range(len(starts)):
-        wire = bits_to_bytes(bits[row])
-        results.append(
-            Candidate(
-                start_sample=float(starts[row]),
-                period_samples=float(period_samples),
-                features=features[row],
-                bits=bits[row],
-                wire=wire,
-                fixed_score=int(fixed_scores[row]),
-                fixed_total=len(FIXED_POSITIONS),
-                low_level=float(low[row]),
-                high_level=float(high[row]),
-                crc_valid=wire_crc_valid(wire),
-            )
+        uniform = np.full(FRAME_BITS, (low[row] + high[row]) / 2.0)
+        global_candidate = _decide(
+            features[row], uniform, float(starts[row]), float(period_samples),
+            float(low[row]), float(high[row]),
         )
+        local_candidate = _decide(
+            features[row], _marker_anchored_thresholds(features[row]),
+            float(starts[row]), float(period_samples), float(low[row]), float(high[row]),
+        )
+        results.append(max(global_candidate, local_candidate, key=_candidate_key))
     return results
 
 
 def find_frame(low_envelope: np.ndarray, high_envelope: np.ndarray, sample_rate: int) -> Candidate:
+    """Global matched-filter frame search across the whole buffer.
+
+    The 72 fixed frame bits (prefix, six 0x72 markers, closing 0xAA) act as
+    the correlation pattern, so the frame is located regardless of handling
+    noise or lead-in pulses preceding it, without an energy-based
+    segmentation step.
+    """
     total_energy = low_envelope + high_envelope
-    approximate_start = _active_region_start(total_energy, sample_rate)
     noise_floor = max(float(np.percentile(total_energy, 25)) * 2.0, 1e-12)
     discriminator = (low_envelope - high_envelope) / (total_energy + noise_floor)
     discriminator_sum = np.r_[0.0, np.cumsum(discriminator)]
+    sign = np.where(FIXED_VALUES == 1, 1.0, -1.0)
 
-    search_start = max(0, approximate_start - round(0.075 * sample_rate))
-    search_end = min(
-        len(total_energy) - round(FRAME_BITS * 0.0096 * sample_rate) - 1,
-        approximate_start + round(0.150 * sample_rate),
-    )
-    coarse_starts = np.arange(search_start, search_end, max(1, round(sample_rate * 0.000125)))
-    coarse_periods = np.arange(sample_rate * 0.00970, sample_rate * 0.01030 + 0.001, 0.50)
+    def matched_scores(starts: np.ndarray, period: float) -> tuple[np.ndarray, np.ndarray]:
+        symbol_starts = starts[:, None] + period * FIXED_POSITIONS[None, :]
+        first = np.rint(symbol_starts + period * 0.1375).astype(np.int64)
+        last = np.rint(symbol_starts + period * 0.8625).astype(np.int64)
+        # FIXED_POSITIONS is not sorted, so bound-check the extremes per row
+        valid = (first.min(axis=1) >= 0) & (last.max(axis=1) < len(discriminator_sum))
+        starts, first, last = starts[valid], first[valid], last[valid]
+        if not len(starts):
+            return starts, np.empty(0)
+        features = (discriminator_sum[last] - discriminator_sum[first]) / np.maximum(last - first, 1)
+        return starts, features @ sign
 
-    coarse: list[Candidate] = []
-    for period in coarse_periods:
-        rows = _evaluate_rows(discriminator_sum, coarse_starts, float(period))
-        rows.sort(key=lambda item: (item.fixed_score, item.separation), reverse=True)
-        coarse.extend(rows[:3])
-    coarse.sort(key=lambda item: (item.crc_valid, item.fixed_score, item.separation), reverse=True)
-    if not coarse:
+    # stage 1: coarse scan (step 1/8 symbol, all periods), top starts per period
+    step = max(1, round(sample_rate * 0.00125))
+    seeds: list[tuple[float, int, float]] = []
+    for period in np.arange(sample_rate * 0.0097, sample_rate * 0.0103 + 1e-9, 0.5):
+        starts, scores = matched_scores(np.arange(0, len(total_energy), step), float(period))
+        if not len(starts):
+            continue
+        taken: list[int] = []
+        for index in np.argsort(scores)[::-1]:
+            start = int(starts[index])
+            if any(abs(start - previous) <= sample_rate // 20 for previous in taken):
+                continue
+            taken.append(start)
+            seeds.append((float(scores[index]), start, float(period)))
+            if len(taken) >= 5:
+                break
+    if not seeds:
         raise DecodeError("could not construct any AudioLINK+ frame candidates")
+    seeds.sort(reverse=True)
+    merged: list[tuple[float, int, float]] = []
+    for seed in seeds:
+        if all(abs(seed[1] - other[1]) >= sample_rate // 10 for other in merged):
+            merged.append(seed)
+        if len(merged) >= 10:
+            break
 
-    refined: list[Candidate] = []
-    seen: set[tuple[int, int]] = set()
-    for seed in coarse[:16]:
-        for period in np.arange(seed.period_samples - 0.65, seed.period_samples + 0.651, 0.025):
-            starts = np.arange(round(seed.start_sample) - 12, round(seed.start_sample) + 13, 1)
-            for candidate in _evaluate_rows(discriminator_sum, starts, float(period)):
-                key = (round(candidate.start_sample), round(candidate.period_samples * 1000))
-                if key not in seen:
-                    seen.add(key)
-                    refined.append(candidate)
+    # stage 2: refine each seed's alignment via the matched filter
+    aligned: list[tuple[float, int, float]] = []
+    for score, start, period in merged:
+        best = (score, start, period)
+        for refined_period in np.arange(period - 0.75, period + 0.751, 0.25):
+            starts, scores = matched_scores(
+                np.arange(start - 90, start + 91, 6), float(refined_period)
+            )
+            if len(starts) and float(scores.max()) > best[0]:
+                index = int(np.argmax(scores))
+                best = (float(scores[index]), int(starts[index]), float(refined_period))
+        aligned.append(best)
+    aligned.sort(reverse=True)
 
-    refined.sort(key=lambda item: (item.crc_valid, item.fixed_score, item.separation), reverse=True)
-    best = refined[0] if refined else coarse[0]
-    if not best.crc_valid:
+    # stage 3: full evaluation (thresholding + CRC) on a fine grid, best first
+    best_invalid: Candidate | None = None
+    for _, start, period in aligned:
+        rows: list[Candidate] = []
+        for refined_period in np.arange(period - 0.65, period + 0.651, 0.025):
+            rows.extend(
+                _evaluate_rows(discriminator_sum, np.arange(start - 12, start + 13), float(refined_period))
+            )
+        rows.sort(key=_candidate_key, reverse=True)
+        if rows and rows[0].crc_valid:
+            return rows[0]
+        if rows and (best_invalid is None or _candidate_key(rows[0]) > _candidate_key(best_invalid)):
+            best_invalid = rows[0]
+    if best_invalid is not None:
         raise DecodeError(
             "an AudioLINK+-like clock was found, but no checksum-valid frame could be reconstructed "
-            f"(best framing score {best.fixed_score}/{best.fixed_total})"
+            f"(best framing score {best_invalid.fixed_score}/{best_invalid.fixed_total})"
         )
-    return best
+    raise DecodeError("no checksum-valid AudioLINK+ frame found")
 
 
 def _counter_age(counter: int, count: int, current_counter: int) -> dict[str, int | None]:

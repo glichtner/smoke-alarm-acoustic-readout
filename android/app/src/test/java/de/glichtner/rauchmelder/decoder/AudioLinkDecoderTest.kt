@@ -162,3 +162,22 @@ class EndToEndDecodeTest {
         assertNull(AudioLinkDecoder.decode(samples, 48000))
     }
 }
+
+class ToneDetectorTest {
+    @Test
+    fun pureDetectorToneScoresHigh() {
+        val rate = 44100
+        val chunk = ShortArray(rate / 10) {
+            (12000 * sin(2.0 * PI * 5480.0 * it / rate)).toInt().toShort()
+        }
+        assertTrue(de.glichtner.rauchmelder.audio.DetectorScanListener.toneRatio(chunk, chunk.size, rate) > 0.6)
+    }
+
+    @Test
+    fun noiseScoresLow() {
+        val rate = 44100
+        val random = java.util.Random(5)
+        val chunk = ShortArray(rate / 10) { (random.nextGaussian() * 6000).toInt().toShort() }
+        assertTrue(de.glichtner.rauchmelder.audio.DetectorScanListener.toneRatio(chunk, chunk.size, rate) < 0.1)
+    }
+}

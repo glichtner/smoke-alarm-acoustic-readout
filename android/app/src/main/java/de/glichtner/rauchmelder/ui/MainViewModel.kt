@@ -4,6 +4,7 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import de.glichtner.rauchmelder.audio.DetectorScanListener
+import de.glichtner.rauchmelder.audio.ScanPhase
 import de.glichtner.rauchmelder.data.AppDatabase
 import de.glichtner.rauchmelder.data.Detector
 import de.glichtner.rauchmelder.data.DetectorWithLastInspection
@@ -21,7 +22,7 @@ import kotlinx.coroutines.launch
 /** State of the scan screen. */
 sealed interface ScanState {
     data object Idle : ScanState
-    data class Listening(val level: Float) : ScanState
+    data class Listening(val phase: ScanPhase) : ScanState
     /** Detector was already registered; the inspection has been stored. */
     data class KnownDetector(val detector: Detector, val reading: DetectorReading) : ScanState
     /** Unknown ID; the location still needs to be entered. */
@@ -53,11 +54,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun startScan() {
         if (listener.isRunning) return
-        _scanState.value = ScanState.Listening(0f)
+        _scanState.value = ScanState.Listening(ScanPhase.LISTENING)
         listener.start(object : DetectorScanListener.Callback {
-            override fun onLevel(rms: Float) {
+            override fun onPhase(phase: ScanPhase) {
                 if (_scanState.value is ScanState.Listening) {
-                    _scanState.value = ScanState.Listening(rms)
+                    _scanState.value = ScanState.Listening(phase)
                 }
             }
 

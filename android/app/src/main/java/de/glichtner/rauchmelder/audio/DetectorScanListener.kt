@@ -17,6 +17,21 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.time.LocalDate
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
+
+/** What the scan is currently doing, for display in the UI. */
+enum class ScanPhase {
+    /** Waiting for a detector tone. */
+    LISTENING,
+
+    /** A detector tone is being received right now. */
+    RECEIVING,
+
+    /** A tone burst has ended (or an interval elapsed) and decoding runs. */
+    DECODING,
+}
 
 /**
  * Records audio from the microphone and periodically runs every supported
@@ -24,6 +39,11 @@ import java.time.LocalDate
  * the test button three times within five seconds, or Hekatron Smartsonic,
  * started by holding the test button for five seconds) is detected
  * automatically from the signal.
+ *
+ * A lightweight Goertzel tone detector watches the FSK bands of both
+ * protocols so the UI can show when a transmission is being received, and a
+ * decode attempt is started immediately when a tone burst ends instead of
+ * waiting for the next interval.
  *
  * With a non-null [debugDir], a failed attempt (timeout without a valid
  * frame) writes the capture buffer as WAV there so the case can be analyzed
@@ -35,7 +55,7 @@ class DetectorScanListener(
 ) {
 
     interface Callback {
-        fun onLevel(rms: Float)
+        fun onPhase(phase: ScanPhase)
         fun onResult(reading: DetectorReading)
         fun onTimeout()
         fun onError(message: String)
@@ -50,11 +70,63 @@ class DetectorScanListener(
         private const val DECODE_INTERVAL_SECONDS = 2.5
         private const val MIN_AUDIO_SECONDS = 5.0
 
+        // tone detector: chunk fraction of energy that must sit in one FSK bin
+        private const val TONE_RATIO_THRESHOLD = 0.25
+        private const val TONE_START_CHUNKS = 2 // 0.2 s of tone starts RECEIVING
+        private const val TONE_END_CHUNKS = 5 // 0.5 s of silence ends the burst
+        private const val MIN_BURST_CHUNKS = 10 // bursts >= 1 s trigger a decode
+
+        // AudioLINK+ tones plus a grid over the Smartsonic tone range
+        private val TONE_BINS_HZ = doubleArrayOf(
+            5500.0, 6800.0,
+            4000.0, 4150.0, 4300.0, 4450.0, 4600.0, 4750.0, 4900.0,
+        )
+
         /** Runs all decoders over one buffer; first valid frame wins. */
         fun decodeAny(samples: FloatArray, sampleRate: Int): DetectorReading? {
             AudioLinkDecoder.decode(samples, sampleRate)?.let { return it.fields.toReading() }
             SmartsonicDecoder.decode(samples, sampleRate, LocalDate.now())?.let { return it.fields.toReading() }
             return null
+        }
+
+        /**
+         * Fraction of the chunk's energy captured by the strongest tone bin,
+         * measured per 10 ms Goertzel window (bandwidth ~100 Hz, so the
+         * device-dependent tone offsets stay inside a bin's main lobe).
+         * Close to 1 for a pure detector tone, near 0 for speech and noise.
+         */
+        fun toneRatio(chunk: ShortArray, length: Int, sampleRate: Int): Double {
+            val window = sampleRate / 100
+            if (length < window) return 0.0
+            var meanSquare = 0.0
+            for (i in 0 until length) {
+                val value = chunk[i] / 32768.0
+                meanSquare += value * value
+            }
+            meanSquare /= length
+            if (meanSquare < 1e-10) return 0.0
+            var best = 0.0
+            val windows = length / window
+            for (frequency in TONE_BINS_HZ) {
+                val omega = 2.0 * PI * frequency / sampleRate
+                var power = 0.0
+                for (w in 0 until windows) {
+                    var re = 0.0
+                    var im = 0.0
+                    val base = w * window
+                    for (i in 0 until window) {
+                        val value = chunk[base + i] / 32768.0
+                        val phase = omega * i
+                        re += value * cos(phase)
+                        im -= value * sin(phase)
+                    }
+                    val magnitude = (re * re + im * im) / (window.toDouble() * window)
+                    power += 2.0 * magnitude
+                }
+                power /= windows
+                if (power > best) best = power
+            }
+            return best / meanSquare
         }
     }
 
@@ -118,7 +190,14 @@ class DetectorScanListener(
             var samplesSinceDecode = 0L
             var totalSamples = 0L
             var decodeJob: Job? = null
+            var decodePending = false
             val decodeResult = java.util.concurrent.atomic.AtomicReference<DetectorReading?>(null)
+
+            var toneActive = false
+            var activeChunks = 0
+            var inactiveChunks = 0
+            var burstChunks = 0
+            var phase = ScanPhase.LISTENING
 
             fun snapshotBuffer(): FloatArray {
                 val available = minOf(written, maxSamples.toLong()).toInt()
@@ -130,8 +209,21 @@ class DetectorScanListener(
                 return snapshot
             }
 
+            suspend fun updatePhase() {
+                val next = when {
+                    toneActive -> ScanPhase.RECEIVING
+                    decodeJob?.isActive == true || decodePending -> ScanPhase.DECODING
+                    else -> ScanPhase.LISTENING
+                }
+                if (next != phase) {
+                    phase = next
+                    notify(callback) { onPhase(next) }
+                }
+            }
+
             try {
                 record.startRecording()
+                notify(callback) { onPhase(ScanPhase.LISTENING) }
                 while (isActive && totalSamples < sampleRate.toLong() * TIMEOUT_SECONDS) {
                     decodeResult.get()?.let { result ->
                         notify(callback) { onResult(result) }
@@ -139,23 +231,43 @@ class DetectorScanListener(
                     }
                     val read = record.read(chunk, 0, chunk.size)
                     if (read <= 0) continue
-                    var sumSquares = 0.0
                     for (i in 0 until read) {
-                        val value = chunk[i] / 32768.0f
-                        ring[(written % maxSamples).toInt()] = value
+                        ring[(written % maxSamples).toInt()] = chunk[i] / 32768.0f
                         written++
-                        sumSquares += value * value
                     }
                     totalSamples += read
                     samplesSinceDecode += read
-                    notify(callback) { onLevel(kotlin.math.sqrt(sumSquares / read).toFloat()) }
+
+                    // tone detector with hysteresis
+                    val ratio = toneRatio(chunk, read, sampleRate)
+                    if (ratio >= TONE_RATIO_THRESHOLD) {
+                        activeChunks++
+                        inactiveChunks = 0
+                        if (!toneActive && activeChunks >= TONE_START_CHUNKS) {
+                            toneActive = true
+                            burstChunks = activeChunks
+                            Log.i(TAG, "tone burst started (ratio %.2f)".format(ratio))
+                        } else if (toneActive) {
+                            burstChunks++
+                        }
+                    } else {
+                        inactiveChunks++
+                        if (toneActive && inactiveChunks >= TONE_END_CHUNKS) {
+                            toneActive = false
+                            Log.i(TAG, "tone burst ended after ~${burstChunks * 100} ms")
+                            // decode right away once a plausible transmission ended
+                            if (burstChunks >= MIN_BURST_CHUNKS) decodePending = true
+                            burstChunks = 0
+                        }
+                        if (!toneActive) activeChunks = 0
+                    }
 
                     // decode in parallel with recording so record.read() keeps
                     // running and the AudioRecord buffer does not overflow
-                    if (totalSamples >= sampleRate * MIN_AUDIO_SECONDS &&
-                        samplesSinceDecode >= sampleRate * DECODE_INTERVAL_SECONDS &&
-                        decodeJob?.isActive != true
-                    ) {
+                    val intervalElapsed = totalSamples >= sampleRate * MIN_AUDIO_SECONDS &&
+                        samplesSinceDecode >= sampleRate * DECODE_INTERVAL_SECONDS
+                    if ((decodePending || intervalElapsed) && decodeJob?.isActive != true) {
+                        decodePending = false
                         samplesSinceDecode = 0
                         val snapshot = snapshotBuffer()
                         decodeJob = launch(Dispatchers.Default) {
@@ -170,6 +282,7 @@ class DetectorScanListener(
                             result?.let { decodeResult.set(it) }
                         }
                     }
+                    updatePhase()
                 }
                 decodeJob?.join()
                 decodeResult.get()?.let { result ->

@@ -403,41 +403,43 @@ def load_audio(path: Path) -> np.ndarray:
     except (wave.Error, EOFError):
         pass
 
+    errors: list[str] = []
     gst = shutil.which("gst-launch-1.0")
-    if gst is None:
-        raise DecodeError(
-            f"{path} is not a PCM WAV and GStreamer is unavailable; "
-            "install gst-launch-1.0 or convert it to PCM WAV"
-        )
-    with tempfile.TemporaryDirectory(prefix="smartsonic-") as temp_dir:
-        decoded = Path(temp_dir) / "decoded.wav"
+    if gst is not None:
+        with tempfile.TemporaryDirectory(prefix="smartsonic-") as temp_dir:
+            decoded = Path(temp_dir) / "decoded.wav"
+            command = [
+                gst, "-q",
+                "filesrc", f"location={path.resolve()}",
+                "!", "decodebin", "!", "audioconvert", "!", "audioresample",
+                "!", f"audio/x-raw,format=S16LE,channels=1,rate={ADC_RATE}",
+                "!", "wavenc", "!", "filesink", f"location={decoded}",
+            ]
+            process = subprocess.run(command, capture_output=True, text=True, check=False)
+            if process.returncode == 0 and decoded.is_file():
+                samples, rate = _read_pcm_wav(decoded)
+                if rate == ADC_RATE:
+                    return samples
+                errors.append(f"unexpected sample rate {rate}")
+            else:
+                errors.append(process.stderr.strip() or process.stdout.strip() or "unknown GStreamer error")
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is not None:
+        # raw PCM on stdout: no temp file, which keeps sandboxed builds working
         command = [
-            gst,
-            "-q",
-            "filesrc",
-            f"location={path.resolve()}",
-            "!",
-            "decodebin",
-            "!",
-            "audioconvert",
-            "!",
-            "audioresample",
-            "!",
-            f"audio/x-raw,format=S16LE,channels=1,rate={ADC_RATE}",
-            "!",
-            "wavenc",
-            "!",
-            "filesink",
-            f"location={decoded}",
+            ffmpeg, "-v", "error", "-i", str(path.resolve()),
+            "-ac", "1", "-ar", str(ADC_RATE), "-f", "s16le", "-",
         ]
-        process = subprocess.run(command, capture_output=True, text=True, check=False)
-        if process.returncode != 0:
-            detail = process.stderr.strip() or process.stdout.strip() or "unknown GStreamer error"
-            raise DecodeError(f"could not decode {path}: {detail}")
-        samples, rate = _read_pcm_wav(decoded)
-        if rate != ADC_RATE:
-            raise DecodeError(f"GStreamer returned unexpected sample rate {rate}")
-        return samples
+        process = subprocess.run(command, capture_output=True, check=False)
+        if process.returncode == 0 and len(process.stdout) >= 2:
+            return np.frombuffer(process.stdout, dtype="<i2").astype(np.float64) / 32768.0
+        errors.append("ffmpeg failed")
+    if not errors:
+        raise DecodeError(
+            f"{path} is not a PCM WAV and neither gst-launch-1.0 nor ffmpeg "
+            "is available; convert it to PCM WAV first"
+        )
+    raise DecodeError(f"could not decode {path}: " + "; ".join(errors))
 
 
 def _iir_filter(samples: np.ndarray, a: Sequence[float], b: Sequence[float]) -> np.ndarray:

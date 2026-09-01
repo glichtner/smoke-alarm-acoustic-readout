@@ -75,8 +75,13 @@ class AudioLinkDecoderTests(unittest.TestCase):
         cases = (
             (root / "sg Schlafzimmer.m4a", "012549f4", "4b02"),
             (root / "Wohnzimmer.m4a", "012549ef", "9107"),
+            # two recordings of one detector amid in-band background noise;
+            # they require the marker-anchored local thresholds
+            (root / "kz1.m4a", "01a55d9d", "e92c"),
+            (root / "kz2.m4a", "01a55d9d", "c3e0"),
         )
-        if not all(path.exists() for path, _, _ in cases):
+        cases = tuple(case for case in cases if case[0].exists())
+        if not cases:
             self.skipTest("original regression recordings are not present")
         for path, alarm_id, crc in cases:
             with self.subTest(path=path.name):

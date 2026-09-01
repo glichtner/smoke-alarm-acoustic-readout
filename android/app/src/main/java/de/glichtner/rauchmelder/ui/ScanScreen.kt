@@ -4,7 +4,12 @@ import android.Manifest
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -48,6 +53,9 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.ui.draw.alpha
+import de.glichtner.rauchmelder.audio.ScanPhase
 import de.glichtner.rauchmelder.model.DetectorReading
 import de.glichtner.rauchmelder.model.formatIsoDate
 import de.glichtner.rauchmelder.model.formatIsoMonth
@@ -123,16 +131,58 @@ fun ScanScreen(
                 }
 
                 is ScanState.Listening -> {
-                    val level by animateFloatAsState(state.level.coerceIn(0f, 1f), label = "level")
-                    CircularProgressIndicator(modifier = Modifier.size(72.dp))
-                    Spacer(Modifier.height(24.dp))
-                    Text("Höre auf Melder-Signal …", style = MaterialTheme.typography.titleMedium)
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        "Pegel: ${"%.0f".format(level * 100)} %",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    when (state.phase) {
+                        ScanPhase.LISTENING -> {
+                            CircularProgressIndicator(modifier = Modifier.size(72.dp))
+                            Spacer(Modifier.height(24.dp))
+                            Text("Warte auf Melder-Signal …", style = MaterialTheme.typography.titleMedium)
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                "Melder auslösen und das Mikrofon direkt an den Melder halten.",
+                                textAlign = TextAlign.Center,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+
+                        ScanPhase.RECEIVING -> {
+                            val pulse = rememberInfiniteTransition(label = "pulse").animateFloat(
+                                initialValue = 0.4f,
+                                targetValue = 1f,
+                                animationSpec = infiniteRepeatable(
+                                    tween(500, easing = LinearEasing),
+                                    RepeatMode.Reverse,
+                                ),
+                                label = "pulseAlpha",
+                            )
+                            Icon(
+                                Icons.Default.GraphicEq,
+                                contentDescription = null,
+                                modifier = Modifier.size(72.dp).alpha(pulse.value),
+                                tint = Color(0xFF388E3C),
+                            )
+                            Spacer(Modifier.height(24.dp))
+                            Text(
+                                "Signal erkannt – Übertragung läuft …",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = Color(0xFF388E3C),
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            Text(
+                                "Handy ruhig halten, bis die Übertragung endet.",
+                                textAlign = TextAlign.Center,
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+
+                        ScanPhase.DECODING -> {
+                            CircularProgressIndicator(modifier = Modifier.size(72.dp))
+                            Spacer(Modifier.height(24.dp))
+                            Text("Signal empfangen – dekodiere …", style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
                     Spacer(Modifier.height(32.dp))
                     OutlinedButton(onClick = { viewModel.stopScan() }) {
                         Text("Abbrechen")

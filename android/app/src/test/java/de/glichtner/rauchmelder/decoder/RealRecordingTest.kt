@@ -53,6 +53,33 @@ class RealRecordingTest {
         assertEquals("012549f4", result!!.fields.alarmId)
     }
 
+    /**
+     * Recordings 3 and 4 contain the frame amid in-band background noise that
+     * shifts the discriminator baseline across the frame; decoding them
+     * requires the marker-anchored local thresholds.
+     */
+    @Test
+    fun recording3WithBackgroundNoise() {
+        val result = decode("audiolink-3.wav")
+        assertNotNull("frame not decoded", result)
+        assertEquals("01a55d9d", result!!.fields.alarmId)
+        assertEquals(3.04, result.fields.batteryVoltage, 1e-9)
+    }
+
+    @Test
+    fun recording3At44100() {
+        val result = decode("audiolink-3-44100.wav")
+        assertNotNull("frame not decoded at 44.1 kHz", result)
+        assertEquals("01a55d9d", result!!.fields.alarmId)
+    }
+
+    @Test
+    fun recording4WithBackgroundNoise() {
+        val result = decode("audiolink-4.wav")
+        assertNotNull("frame not decoded", result)
+        assertEquals("01a55d9d", result!!.fields.alarmId)
+    }
+
     @Test
     fun recording2() {
         val result = decode("audiolink-2.wav")

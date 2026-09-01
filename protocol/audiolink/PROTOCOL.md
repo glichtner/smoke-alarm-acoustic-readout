@@ -238,16 +238,28 @@ A batch receiver for a captured buffer works as follows:
    (expected `1` positive, expected `0` negative). This score locates the
    frame anywhere in the buffer, including behind handling noise or the
    lead-in pulses, without an energy-based segmentation step.
-4. For the best-scoring candidates, refine start and period on a fine grid,
-   sample all 328 symbol means, cluster them into two classes (two-means
-   with the 25th/75th percentiles as initial centers), and slice bits.
-5. Assemble 41 bytes MSB first; require the prefix, all six markers, and the
+4. For the best-scoring candidates, refine start and period on a fine grid
+   and sample all 328 symbol means.
+5. Decide bits twice and keep the better result: (a) against a single global
+   threshold from two-means clustering of the symbol means, and (b) against
+   per-symbol thresholds anchored at the known marker bits — each 0x72
+   marker and the closing 0xAA contain four known one and four known zero
+   bits whose feature means give a local threshold, interpolated linearly
+   between the anchors. The local thresholds compensate baseline drift of
+   the discriminator across the 3.3 s frame (e.g. from in-band background
+   noise), which a single global threshold cannot.
+6. Assemble 41 bytes MSB first; require the prefix, all six markers, and the
    end marker; extract the payload; accept the frame only if the CRC
-   matches.
+   matches. If all 72 fixed bits match but the CRC fails, up to two of the
+   least confident non-fixed bits (smallest distance to the decision
+   threshold) may be flipped and the CRC re-checked; with a few dozen
+   combinations against a 16-bit CRC, false accepts remain negligible.
 
 A live receiver additionally keeps a rolling buffer of at least 12 s (frame
 plus lead-in/lead-out plus margin) and repeats the batch search every few
-seconds until a frame is accepted. Because the marker and CRC checks require
+seconds until a frame is accepted; a cheap tone detector on the two FSK
+bands (e.g. Goertzel bins) can signal reception to the user and trigger a
+decode attempt as soon as a tone burst ends. Because the marker and CRC checks require
 72 exact fixed bits plus a 16-bit CRC, the false-accept probability of the
 search is negligible even over many candidates.
 

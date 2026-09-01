@@ -172,6 +172,134 @@ object AudioLinkDecoder {
         return sorted[low] * (1 - fraction) + sorted[high] * fraction
     }
 
+    private val MARKER_ONE_BITS = intArrayOf(1, 2, 3, 6) // 0x72 = 01110010
+    private val MARKER_ZERO_BITS = intArrayOf(0, 4, 5, 7)
+    private val END_ONE_BITS = intArrayOf(0, 2, 4, 6) // 0xAA = 10101010
+    private val END_ZERO_BITS = intArrayOf(1, 3, 5, 7)
+
+    private val fixedBitSet = BooleanArray(FRAME_BITS).also { set ->
+        for (position in fixedBitPositions) set[position] = true
+    }
+
+    /**
+     * Per-symbol decision thresholds anchored at the known marker bytes: each
+     * 0x72 marker and the closing 0xAA contain four known one and four known
+     * zero bits, whose feature means give a local threshold; values between
+     * anchors are interpolated linearly. This compensates baseline drift of
+     * the discriminator across the frame (e.g. from in-band background
+     * noise), which a single global threshold cannot.
+     */
+    private fun markerAnchoredThresholds(features: DoubleArray): DoubleArray {
+        val anchorX = DoubleArray(MARKER_BYTE_OFFSETS.size + 1)
+        val anchorY = DoubleArray(MARKER_BYTE_OFFSETS.size + 1)
+        for ((index, offset) in MARKER_BYTE_OFFSETS.withIndex()) {
+            var ones = 0.0
+            var zeros = 0.0
+            for (bit in MARKER_ONE_BITS) ones += features[offset * 8 + bit]
+            for (bit in MARKER_ZERO_BITS) zeros += features[offset * 8 + bit]
+            anchorX[index] = offset * 8 + 3.5
+            anchorY[index] = (ones / 4 + zeros / 4) / 2
+        }
+        var ones = 0.0
+        var zeros = 0.0
+        for (bit in END_ONE_BITS) ones += features[320 + bit]
+        for (bit in END_ZERO_BITS) zeros += features[320 + bit]
+        anchorX[anchorX.size - 1] = 323.5
+        anchorY[anchorY.size - 1] = (ones / 4 + zeros / 4) / 2
+
+        val thresholds = DoubleArray(FRAME_BITS)
+        var segment = 0
+        for (i in 0 until FRAME_BITS) {
+            val x = i.toDouble()
+            thresholds[i] = when {
+                x <= anchorX[0] -> anchorY[0]
+                x >= anchorX[anchorX.size - 1] -> anchorY[anchorY.size - 1]
+                else -> {
+                    while (x > anchorX[segment + 1]) segment++
+                    val fraction = (x - anchorX[segment]) / (anchorX[segment + 1] - anchorX[segment])
+                    anchorY[segment] + (anchorY[segment + 1] - anchorY[segment]) * fraction
+                }
+            }
+        }
+        return thresholds
+    }
+
+    private fun bitsToWire(bits: ByteArray): ByteArray {
+        val wire = ByteArray(FRAME_BYTES)
+        for (byteIndex in 0 until FRAME_BYTES) {
+            var value = 0
+            for (bit in 0 until 8) value = (value shl 1) or bits[byteIndex * 8 + bit].toInt()
+            wire[byteIndex] = value.toByte()
+        }
+        return wire
+    }
+
+    /**
+     * Confidence-guided recovery for a structurally valid frame whose CRC
+     * fails: flip up to two of the least confident non-fixed bits (smallest
+     * distance to the decision threshold) and accept the first combination
+     * whose CRC matches. With the 72 fixed bits already exact and only a few
+     * dozen combinations tried against a 16-bit CRC, false accepts are
+     * negligible.
+     */
+    private fun confidenceFlips(bits: ByteArray, features: DoubleArray, thresholds: DoubleArray): ByteArray? {
+        val order = (0 until FRAME_BITS)
+            .filter { !fixedBitSet[it] }
+            .sortedBy { abs(features[it] - thresholds[it]) }
+        val singles = order.take(12)
+        for (i in singles) {
+            val flipped = bits.clone()
+            flipped[i] = (1 - flipped[i]).toByte()
+            val wire = bitsToWire(flipped)
+            if (wireCrcValid(wire)) return wire
+        }
+        val pairs = order.take(8)
+        for (a in pairs.indices) {
+            for (b in a + 1 until pairs.size) {
+                val flipped = bits.clone()
+                flipped[pairs[a]] = (1 - flipped[pairs[a]]).toByte()
+                flipped[pairs[b]] = (1 - flipped[pairs[b]]).toByte()
+                val wire = bitsToWire(flipped)
+                if (wireCrcValid(wire)) return wire
+            }
+        }
+        return null
+    }
+
+    private fun candidateFromThresholds(
+        features: DoubleArray,
+        thresholds: DoubleArray,
+        start: Int,
+        period: Double,
+        low: Double,
+        high: Double,
+    ): Candidate {
+        val bits = ByteArray(FRAME_BITS)
+        for (i in 0 until FRAME_BITS) bits[i] = if (features[i] >= thresholds[i]) 1 else 0
+        var fixedScore = 0
+        for (i in fixedBitPositions.indices) {
+            if (bits[fixedBitPositions[i]] == fixedBitValues[i]) fixedScore++
+        }
+        var wire = bitsToWire(bits)
+        var crcValid = wireCrcValid(wire)
+        if (!crcValid && fixedScore == fixedBitPositions.size) {
+            confidenceFlips(bits, features, thresholds)?.let {
+                wire = it
+                crcValid = true
+            }
+        }
+        return Candidate(
+            startSample = start.toDouble(),
+            periodSamples = period,
+            bits = bits,
+            wire = wire,
+            fixedScore = fixedScore,
+            lowLevel = low,
+            highLevel = high,
+            crcValid = crcValid,
+        )
+    }
+
     /** Evaluates a candidate (start and period in samples) via the discriminator cumsum. */
     private fun evaluateCandidate(
         discriminatorSum: DoubleArray,
@@ -211,29 +339,12 @@ object AudioLinkDecoder {
             low = newLow
             high = newHigh
         }
-        val threshold = (low + high) / 2.0
-        val bits = ByteArray(FRAME_BITS)
-        for (i in 0 until FRAME_BITS) bits[i] = if (features[i] >= threshold) 1 else 0
-        var fixedScore = 0
-        for (i in fixedBitPositions.indices) {
-            if (bits[fixedBitPositions[i]] == fixedBitValues[i]) fixedScore++
-        }
-        val wire = ByteArray(FRAME_BYTES)
-        for (byteIndex in 0 until FRAME_BYTES) {
-            var value = 0
-            for (bit in 0 until 8) value = (value shl 1) or bits[byteIndex * 8 + bit].toInt()
-            wire[byteIndex] = value.toByte()
-        }
-        return Candidate(
-            startSample = start.toDouble(),
-            periodSamples = period,
-            bits = bits,
-            wire = wire,
-            fixedScore = fixedScore,
-            lowLevel = low,
-            highLevel = high,
-            crcValid = wireCrcValid(wire),
-        )
+        val globalThreshold = (low + high) / 2.0
+        val uniform = DoubleArray(FRAME_BITS) { globalThreshold }
+        val globalCandidate = candidateFromThresholds(features, uniform, start, period, low, high)
+        val localCandidate =
+            candidateFromThresholds(features, markerAnchoredThresholds(features), start, period, low, high)
+        return if (candidateOrder(localCandidate, globalCandidate) <= 0) localCandidate else globalCandidate
     }
 
     private fun percentileUnsorted(data: DoubleArray, percentile: Double): Double {
