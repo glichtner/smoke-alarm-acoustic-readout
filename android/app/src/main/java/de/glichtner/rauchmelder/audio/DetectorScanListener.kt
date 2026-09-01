@@ -70,16 +70,25 @@ class DetectorScanListener(
         private const val DECODE_INTERVAL_SECONDS = 2.5
         private const val MIN_AUDIO_SECONDS = 5.0
 
-        // tone detector: chunk fraction of energy that must sit in one FSK bin
-        private const val TONE_RATIO_THRESHOLD = 0.25
-        private const val TONE_START_CHUNKS = 2 // 0.2 s of tone starts RECEIVING
+        // Tone detector, calibrated on the real recordings: outside a frame
+        // (button beeps, handling noise, speech) the ratio stays above the
+        // threshold for at most ~0.2 s, while a frame holds it for its whole
+        // duration with only single-chunk dips. Requiring 0.8 s of sustained
+        // tone therefore rejects fiddling with the detector, and bridging
+        // single quiet chunks keeps the indicator steady during a frame.
+        private const val TONE_RATIO_THRESHOLD = 0.2
+        private const val TONE_START_CHUNKS = 8 // 0.8 s sustained tone starts RECEIVING
+        private const val TONE_DROPOUT_CHUNKS = 1 // single quiet chunks are bridged
         private const val TONE_END_CHUNKS = 5 // 0.5 s of silence ends the burst
-        private const val MIN_BURST_CHUNKS = 10 // bursts >= 1 s trigger a decode
+        private const val MIN_BURST_CHUNKS = 25 // bursts >= 2.5 s trigger a decode
 
-        // AudioLINK+ tones plus a grid over the Smartsonic tone range
+        // AudioLINK+ tones, a grid over the Smartsonic tone range, and the
+        // 3 kHz comb component that runs through the whole AudioLINK+ frame
+        // (its FSK tones alone dip during long zero runs)
         private val TONE_BINS_HZ = doubleArrayOf(
             5500.0, 6800.0,
             4000.0, 4150.0, 4300.0, 4450.0, 4600.0, 4750.0, 4900.0,
+            2900.0, 3000.0, 3100.0, 3200.0,
         )
 
         /** Runs all decoders over one buffer; first valid frame wins. */
@@ -194,9 +203,10 @@ class DetectorScanListener(
             val decodeResult = java.util.concurrent.atomic.AtomicReference<DetectorReading?>(null)
 
             var toneActive = false
-            var activeChunks = 0
-            var inactiveChunks = 0
+            var activeStreak = 0
+            var quietStreak = 0
             var burstChunks = 0
+            var burstDecode = false
             var phase = ScanPhase.LISTENING
 
             fun snapshotBuffer(): FloatArray {
@@ -210,9 +220,11 @@ class DetectorScanListener(
             }
 
             suspend fun updatePhase() {
+                // interval decode attempts run silently; only a burst-triggered
+                // attempt is shown as DECODING
                 val next = when {
                     toneActive -> ScanPhase.RECEIVING
-                    decodeJob?.isActive == true || decodePending -> ScanPhase.DECODING
+                    burstDecode && (decodeJob?.isActive == true || decodePending) -> ScanPhase.DECODING
                     else -> ScanPhase.LISTENING
                 }
                 if (next != phase) {
@@ -238,28 +250,31 @@ class DetectorScanListener(
                     totalSamples += read
                     samplesSinceDecode += read
 
-                    // tone detector with hysteresis
+                    // tone detector: sustained-tone start, dip bridging, quiet end
                     val ratio = toneRatio(chunk, read, sampleRate)
                     if (ratio >= TONE_RATIO_THRESHOLD) {
-                        activeChunks++
-                        inactiveChunks = 0
-                        if (!toneActive && activeChunks >= TONE_START_CHUNKS) {
-                            toneActive = true
-                            burstChunks = activeChunks
-                            Log.i(TAG, "tone burst started (ratio %.2f)".format(ratio))
-                        } else if (toneActive) {
-                            burstChunks++
-                        }
+                        activeStreak += 1 + if (activeStreak > 0) quietStreak else 0
+                        quietStreak = 0
                     } else {
-                        inactiveChunks++
-                        if (toneActive && inactiveChunks >= TONE_END_CHUNKS) {
+                        quietStreak++
+                        if (quietStreak > TONE_DROPOUT_CHUNKS) activeStreak = 0
+                    }
+                    if (!toneActive && activeStreak >= TONE_START_CHUNKS) {
+                        toneActive = true
+                        burstChunks = activeStreak
+                        Log.i(TAG, "tone burst started (ratio %.2f)".format(ratio))
+                    } else if (toneActive) {
+                        if (quietStreak == 0 || quietStreak <= TONE_DROPOUT_CHUNKS) burstChunks++
+                        if (quietStreak >= TONE_END_CHUNKS) {
                             toneActive = false
                             Log.i(TAG, "tone burst ended after ~${burstChunks * 100} ms")
                             // decode right away once a plausible transmission ended
-                            if (burstChunks >= MIN_BURST_CHUNKS) decodePending = true
+                            if (burstChunks >= MIN_BURST_CHUNKS) {
+                                decodePending = true
+                                burstDecode = true
+                            }
                             burstChunks = 0
                         }
-                        if (!toneActive) activeChunks = 0
                     }
 
                     // decode in parallel with recording so record.read() keeps
@@ -270,6 +285,7 @@ class DetectorScanListener(
                         decodePending = false
                         samplesSinceDecode = 0
                         val snapshot = snapshotBuffer()
+                        val fromBurst = burstDecode
                         decodeJob = launch(Dispatchers.Default) {
                             val startedAt = System.currentTimeMillis()
                             val result = decodeAny(snapshot, sampleRate)
@@ -280,6 +296,7 @@ class DetectorScanListener(
                                     "${System.currentTimeMillis() - startedAt} ms",
                             )
                             result?.let { decodeResult.set(it) }
+                            if (fromBurst) burstDecode = false
                         }
                     }
                     updatePhase()
