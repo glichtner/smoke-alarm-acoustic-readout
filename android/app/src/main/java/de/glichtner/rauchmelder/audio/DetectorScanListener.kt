@@ -70,26 +70,25 @@ class DetectorScanListener(
         private const val DECODE_INTERVAL_SECONDS = 2.5
         private const val MIN_AUDIO_SECONDS = 5.0
 
-        // Tone detector, calibrated on the real recordings: outside a frame
-        // (button beeps, handling noise, speech) the ratio stays above the
-        // threshold for at most ~0.2 s, while a frame holds it for its whole
-        // duration with only single-chunk dips. Requiring 0.8 s of sustained
-        // tone therefore rejects fiddling with the detector, and bridging
-        // single quiet chunks keeps the indicator steady during a frame.
+        // Tone detector, calibrated on the real recordings of both protocols:
+        // in-frame chunks stay above the threshold (5th percentile 0.28,
+        // Smartsonic minimum 0.25) with only single-chunk dips, while
+        // interference exceeds it only briefly. Requiring 0.8 s of sustained
+        // tone rejects fiddling with the detector, and bridging single quiet
+        // chunks keeps the indicator steady during a frame; on all real
+        // recordings this yields exactly one burst per transmission and none
+        // outside.
         private const val TONE_RATIO_THRESHOLD = 0.2
         private const val TONE_START_CHUNKS = 8 // 0.8 s sustained tone starts RECEIVING
         private const val TONE_DROPOUT_CHUNKS = 1 // single quiet chunks are bridged
         private const val TONE_END_CHUNKS = 5 // 0.5 s of silence ends the burst
         private const val MIN_BURST_CHUNKS = 25 // bursts >= 2.5 s trigger a decode
 
-        // AudioLINK+ tones, a grid over the Smartsonic tone range, and the
-        // 3 kHz comb component that runs through the whole AudioLINK+ frame
-        // (its FSK tones alone dip during long zero runs)
-        private val TONE_BINS_HZ = doubleArrayOf(
-            5500.0, 6800.0,
-            4000.0, 4150.0, 4300.0, 4450.0, 4600.0, 4750.0, 4900.0,
-            2900.0, 3000.0, 3100.0, 3200.0,
-        )
+        // AudioLINK+ tones, the Smartsonic tone range, and the 3 kHz comb
+        // component that runs through the whole AudioLINK+ frame (its FSK
+        // tones alone dip during long zero runs). The 5 ms analysis windows
+        // have a ~±200 Hz main lobe, so three bins cover the Smartsonic range.
+        private val TONE_BINS_HZ = doubleArrayOf(5500.0, 6800.0, 4100.0, 4450.0, 4800.0, 3000.0)
 
         /** Runs all decoders over one buffer; first valid frame wins. */
         fun decodeAny(samples: FloatArray, sampleRate: Int): DetectorReading? {
@@ -99,13 +98,16 @@ class DetectorScanListener(
         }
 
         /**
-         * Fraction of the chunk's energy captured by the strongest tone bin,
-         * measured per 10 ms Goertzel window (bandwidth ~100 Hz, so the
-         * device-dependent tone offsets stay inside a bin's main lobe).
-         * Close to 1 for a pure detector tone, near 0 for speech and noise.
+         * Fraction of the chunk's energy captured by detector tones: per 5 ms
+         * Goertzel window the strongest bin is taken, and those maxima are
+         * averaged over the chunk. Taking the per-window maximum first is
+         * essential for FSK - the active tone changes within a chunk (every
+         * ~6 ms for Smartsonic's biphase symbols), so averaging per bin over
+         * the chunk would dilute the ratio below any usable threshold. Close
+         * to 1 for detector tones, near 0 for speech and noise.
          */
         fun toneRatio(chunk: ShortArray, length: Int, sampleRate: Int): Double {
-            val window = sampleRate / 100
+            val window = sampleRate / 200
             if (length < window) return 0.0
             var meanSquare = 0.0
             for (i in 0 until length) {
@@ -114,28 +116,27 @@ class DetectorScanListener(
             }
             meanSquare /= length
             if (meanSquare < 1e-10) return 0.0
-            var best = 0.0
             val windows = length / window
-            for (frequency in TONE_BINS_HZ) {
-                val omega = 2.0 * PI * frequency / sampleRate
-                var power = 0.0
-                for (w in 0 until windows) {
+            var sumOfBest = 0.0
+            for (w in 0 until windows) {
+                val base = w * window
+                var best = 0.0
+                for (frequency in TONE_BINS_HZ) {
+                    val omega = 2.0 * PI * frequency / sampleRate
                     var re = 0.0
                     var im = 0.0
-                    val base = w * window
                     for (i in 0 until window) {
                         val value = chunk[base + i] / 32768.0
                         val phase = omega * i
                         re += value * cos(phase)
                         im -= value * sin(phase)
                     }
-                    val magnitude = (re * re + im * im) / (window.toDouble() * window)
-                    power += 2.0 * magnitude
+                    val power = 2.0 * (re * re + im * im) / (window.toDouble() * window)
+                    if (power > best) best = power
                 }
-                power /= windows
-                if (power > best) best = power
+                sumOfBest += best
             }
-            return best / meanSquare
+            return (sumOfBest / windows) / meanSquare
         }
     }
 
