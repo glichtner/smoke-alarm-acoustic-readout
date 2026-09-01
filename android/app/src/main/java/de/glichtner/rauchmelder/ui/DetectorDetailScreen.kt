@@ -203,17 +203,18 @@ private fun InspectionCard(inspection: Inspection) {
 @Composable
 private fun InfoRow(label: String, value: String) {
     Row(modifier = Modifier.fillMaxWidth()) {
+        // the label keeps its intrinsic width so long words never wrap mid-word
         Text(
             label,
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.weight(1f),
+            modifier = Modifier.padding(end = 12.dp),
         )
         Text(
             value,
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Medium,
-            modifier = Modifier.weight(1.4f),
+            modifier = Modifier.weight(1f),
             textAlign = TextAlign.End,
         )
     }

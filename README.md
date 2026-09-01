@@ -96,6 +96,8 @@ cd android
 
 The decoder tests against real recordings run when `RAUCHMELDER_WAV_DIR`
 points to a directory with mono PCM WAV conversions of the files in `data/`:
-`audiolink-1.wav`, `audiolink-2.wav` (48 kHz, Ei650i), `smartsonic-44100.wav`,
-`smartsonic-48000.wav` (Hekatron Genius Plus). Without it those tests are skipped;
-synthesized waveforms still cover both decoders end to end.
+`audiolink-1.wav` … `audiolink-12.wav` plus `audiolink-3-44100.wav` (48 kHz
+unless noted, Ei650i; 3/4 with in-band background noise, 5-12 voice-memo
+captures in pairs of two per detector) and `smartsonic-44100.wav`,
+`smartsonic-48000.wav` (Hekatron Genius Plus). Without it those tests are
+skipped; synthesized waveforms still cover both decoders end to end.

@@ -79,6 +79,14 @@ class AudioLinkDecoderTests(unittest.TestCase):
             # they require the marker-anchored local thresholds
             (root / "kz1.m4a", "01a55d9d", "e92c"),
             (root / "kz2.m4a", "01a55d9d", "c3e0"),
+            # voice-memo recordings, two per detector; the harmonic bands are
+            # needed for some of them
+            (root / "Sprache 260901_185243.m4a", "01a55d9b", "36a2"),
+            (root / "Sprache 260901_185405.m4a", "01a55d95", "2ebf"),
+            (root / "Sprache 260901_185420.m4a", "01a55d95", "2ebf"),
+            (root / "Sprache 260901_185716.m4a", "01a55d96", "308e"),
+            (root / "Sprache 260901_185734.m4a", "01a55d96", "7070"),
+            (root / "Sprache 260901_185921.m4a", "01a55d98", "92d4"),
         )
         cases = tuple(case for case in cases if case[0].exists())
         if not cases:

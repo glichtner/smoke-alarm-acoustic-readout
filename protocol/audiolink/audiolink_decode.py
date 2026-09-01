@@ -148,14 +148,52 @@ def load_audio(path: Path) -> tuple[np.ndarray, int]:
 
 def fsk_envelopes(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
     """Return analytic-envelope magnitudes around 5.5 and 6.8 kHz."""
+    low = _band_envelope(samples, sample_rate, 5500.0)
+    high = _band_envelope(samples, sample_rate, 6800.0)
+    return low, high
+
+
+def _band_envelope(samples: np.ndarray, sample_rate: int, center: float, half: float = 250.0) -> np.ndarray:
     spectrum = np.fft.fft(samples)
     frequencies = np.fft.fftfreq(len(samples), 1.0 / sample_rate)
-    envelopes: list[np.ndarray] = []
-    for low, high in ((5250.0, 5750.0), (6550.0, 7050.0)):
-        keep = (frequencies >= low) & (frequencies <= high)
-        analytic = np.fft.ifft(spectrum * (2.0 * keep))
-        envelopes.append(np.abs(analytic))
-    return envelopes[0], envelopes[1]
+    keep = (frequencies >= center - half) & (frequencies <= center + half)
+    return np.abs(np.fft.ifft(spectrum * (2.0 * keep)))
+
+
+# The loud piezo sounder is rich in harmonics, which carry the same bit
+# information in bands that everyday interference (speech, sibilants) rarely
+# reaches.  Fundamentals are always used; a harmonic band joins only when it
+# shows real activity, so clean or band-limited signals are unaffected.
+ONE_BANDS_HZ = (5500.0, 11000.0, 16500.0)
+ZERO_BANDS_HZ = (6800.0, 13600.0)
+
+
+def combined_envelopes(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-class envelope evidence combined over fundamental and harmonics.
+
+    Each band is normalized by its 95th percentile so bands with different
+    absolute levels contribute comparably; a band is used only when its 95th
+    percentile exceeds four times its 25th percentile (i.e. it actually
+    contains bursts rather than a flat noise floor), with the fundamental of
+    each class always included.
+    """
+
+    def combine(bands: tuple[float, ...]) -> np.ndarray:
+        result: np.ndarray | None = None
+        for index, center in enumerate(bands):
+            if center + 250.0 >= sample_rate / 2.0:
+                continue
+            envelope = _band_envelope(samples, sample_rate, center)
+            p95 = float(np.percentile(envelope, 95))
+            p25 = float(np.percentile(envelope, 25))
+            if index > 0 and p95 <= 4.0 * p25:
+                continue
+            normalized = envelope / max(p95, 1e-12)
+            result = normalized if result is None else result + normalized
+        assert result is not None
+        return result
+
+    return combine(ONE_BANDS_HZ), combine(ZERO_BANDS_HZ)
 
 
 def crc_ccitt_false(data: bytes) -> int:
@@ -275,6 +313,16 @@ def _confidence_flips(
             wire = bits_to_bytes(flipped)
             if wire_crc_valid(wire):
                 return flipped, wire
+    for a in range(len(pairs)):
+        for b in range(a + 1, len(pairs)):
+            for c in range(b + 1, len(pairs)):
+                flipped = bits.copy()
+                flipped[pairs[a]] ^= 1
+                flipped[pairs[b]] ^= 1
+                flipped[pairs[c]] ^= 1
+                wire = bits_to_bytes(flipped)
+                if wire_crc_valid(wire):
+                    return flipped, wire
     return None
 
 
@@ -564,7 +612,7 @@ def decode_file(path: Path) -> dict[str, Any]:
         raise DecodeError("audio is too short to contain the 3.28-second frame")
     if sample_rate < 15000:
         raise DecodeError("sample rate is too low for the 6.8-kHz FSK band")
-    low_envelope, high_envelope = fsk_envelopes(samples, sample_rate)
+    low_envelope, high_envelope = combined_envelopes(samples, sample_rate)
     candidate = find_frame(low_envelope, high_envelope, sample_rate)
     payload = wire_to_payload(candidate.wire)
     received_crc = int.from_bytes(candidate.wire[38:40], "big")

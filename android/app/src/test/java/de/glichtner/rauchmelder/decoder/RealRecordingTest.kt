@@ -2,6 +2,7 @@ package de.glichtner.rauchmelder.decoder
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
@@ -78,6 +79,36 @@ class RealRecordingTest {
         val result = decode("audiolink-4.wav")
         assertNotNull("frame not decoded", result)
         assertEquals("01a55d9d", result!!.fields.alarmId)
+    }
+
+    /**
+     * Recordings 5-12 are voice-memo captures, two per detector (four further
+     * detectors). The first capture of each pair must decode; a second,
+     * heavily corrupted capture may fail, but must never yield a different
+     * ID than its pair - a wrong ID would silently register a phantom
+     * detector.
+     */
+    @Test
+    fun recordingPairsYieldConsistentIds() {
+        val pairs = listOf(
+            Triple("audiolink-5.wav", "audiolink-6.wav", "01a55d9b"),
+            Triple("audiolink-7.wav", "audiolink-8.wav", "01a55d95"),
+            Triple("audiolink-9.wav", "audiolink-10.wav", "01a55d96"),
+            Triple("audiolink-11.wav", "audiolink-12.wav", "01a55d98"),
+        )
+        var decoded = 0
+        for ((first, second, id) in pairs) {
+            val resultA = decode(first)
+            assertNotNull("$first not decoded", resultA)
+            assertEquals(id, resultA!!.fields.alarmId)
+            decoded++
+            val resultB = decode(second)
+            if (resultB != null) {
+                assertEquals("$second decoded with a wrong ID", id, resultB.fields.alarmId)
+                decoded++
+            }
+        }
+        assertTrue("expected at least 6 of 8 pair recordings to decode", decoded >= 6)
     }
 
     @Test

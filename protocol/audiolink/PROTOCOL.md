@@ -230,7 +230,12 @@ A batch receiver for a captured buffer works as follows:
 
 1. Compute the band envelopes around 5.5 and 6.8 kHz (analytic envelope via
    band-pass, or quadrature demodulation with a ~±250 Hz low-pass) and the
-   normalized discriminator `D`.
+   normalized discriminator `D`. The sounder is rich in harmonics, so the
+   envelopes of 11 and 16.5 kHz (for `1`) and 13.6 kHz (for `0`) carry the
+   same bit information in bands that everyday interference such as speech
+   rarely reaches; combining each class's bands - normalized per band by a
+   high percentile, and including a harmonic band only when it shows real
+   burst activity - makes the discriminator markedly more robust.
 2. Keep a prefix sum of `D` so that the mean of `D` over any symbol window
    is available in O(1).
 3. Search jointly over frame start and symbol period (10 ms ± 3 %). Score a
