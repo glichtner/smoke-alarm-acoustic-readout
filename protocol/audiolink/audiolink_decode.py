@@ -162,38 +162,52 @@ def _band_envelope(samples: np.ndarray, sample_rate: int, center: float, half: f
 
 # The loud piezo sounder is rich in harmonics, which carry the same bit
 # information in bands that everyday interference (speech, sibilants) rarely
-# reaches.  Fundamentals are always used; a harmonic band joins only when it
-# shows real activity, so clean or band-limited signals are unaffected.
-ONE_BANDS_HZ = (5500.0, 11000.0, 16500.0)
+# reaches.  Use matched harmonic orders for the two FSK classes: combining an
+# extra harmonic for only one class can turn unrelated high-frequency noise
+# into a systematic bit bias.  Fundamentals are always used; the second
+# harmonic joins only when it shows real activity, so clean or band-limited
+# signals are unaffected.  Still higher harmonics are too close to typical
+# microphone/codec cutoffs to be dependable evidence.
+ONE_BANDS_HZ = (5500.0, 11000.0)
 ZERO_BANDS_HZ = (6800.0, 13600.0)
 
 
-def combined_envelopes(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
-    """Per-class envelope evidence combined over fundamental and harmonics.
+def envelope_views(samples: np.ndarray, sample_rate: int) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Return a small, predetermined set of matched FSK evidence views.
 
-    Each band is normalized by its 95th percentile so bands with different
-    absolute levels contribute comparably; a band is used only when its 95th
-    percentile exceeds four times its 25th percentile (i.e. it actually
-    contains bursts rather than a flat noise floor), with the fundamental of
-    each class always included.
+    Bands are normalized by their 95th percentile. The second harmonic is
+    added to the primary view only when *both* FSK classes show real burst
+    activity; this prevents an unmatched band from biasing one class. When
+    present, the harmonic-only and fundamental-only views are fallbacks for
+    interference confined to one frequency range. Every view still has to
+    produce the transmitted bits, fixed framing, and CRC exactly.
     """
 
-    def combine(bands: tuple[float, ...]) -> np.ndarray:
-        result: np.ndarray | None = None
-        for index, center in enumerate(bands):
-            if center + 250.0 >= sample_rate / 2.0:
-                continue
-            envelope = _band_envelope(samples, sample_rate, center)
-            p95 = float(np.percentile(envelope, 95))
-            p25 = float(np.percentile(envelope, 25))
-            if index > 0 and p95 <= 4.0 * p25:
-                continue
-            normalized = envelope / max(p95, 1e-12)
-            result = normalized if result is None else result + normalized
-        assert result is not None
-        return result
+    def normalized(center: float) -> tuple[np.ndarray, bool]:
+        envelope = _band_envelope(samples, sample_rate, center)
+        p95 = float(np.percentile(envelope, 95))
+        p25 = float(np.percentile(envelope, 25))
+        return envelope / max(p95, 1e-12), p95 > 4.0 * p25
 
-    return combine(ONE_BANDS_HZ), combine(ZERO_BANDS_HZ)
+    one_fundamental, _ = normalized(ONE_BANDS_HZ[0])
+    zero_fundamental, _ = normalized(ZERO_BANDS_HZ[0])
+    views: list[tuple[np.ndarray, np.ndarray]] = []
+    if len(ONE_BANDS_HZ) > 1 and len(ZERO_BANDS_HZ) > 1:
+        one_harmonic, one_active = normalized(ONE_BANDS_HZ[1])
+        zero_harmonic, zero_active = normalized(ZERO_BANDS_HZ[1])
+        if one_active and zero_active:
+            views.append((
+                one_fundamental + one_harmonic,
+                zero_fundamental + zero_harmonic,
+            ))
+            views.append((one_harmonic, zero_harmonic))
+    views.append((one_fundamental, zero_fundamental))
+    return views
+
+
+def combined_envelopes(samples: np.ndarray, sample_rate: int) -> tuple[np.ndarray, np.ndarray]:
+    """Return the primary matched-band evidence view."""
+    return envelope_views(samples, sample_rate)[0]
 
 
 def crc_ccitt_false(data: bytes) -> int:
@@ -262,9 +276,6 @@ MARKER_ONE_BITS = (1, 2, 3, 6)   # 0x72 = 01110010
 MARKER_ZERO_BITS = (0, 4, 5, 7)
 END_ONE_BITS = (0, 2, 4, 6)      # 0xAA = 10101010
 END_ZERO_BITS = (1, 3, 5, 7)
-_NON_FIXED_POSITIONS = np.asarray(
-    [index for index in range(FRAME_BITS) if index not in set(int(p) for p in FIXED_POSITIONS)]
-)
 
 
 def _marker_anchored_thresholds(features: np.ndarray) -> np.ndarray:
@@ -288,44 +299,6 @@ def _marker_anchored_thresholds(features: np.ndarray) -> np.ndarray:
     return np.interp(np.arange(FRAME_BITS, dtype=np.float64), xs, ys)
 
 
-def _confidence_flips(
-    bits: np.ndarray, features: np.ndarray, thresholds: np.ndarray
-) -> tuple[np.ndarray, bytes] | None:
-    """Flip up to two least-confident non-fixed bits to satisfy the CRC.
-
-    Only used when all 72 fixed bits already match; with a few dozen
-    combinations against a 16-bit CRC, false accepts are negligible.
-    """
-    confidence = np.abs(features[_NON_FIXED_POSITIONS] - thresholds[_NON_FIXED_POSITIONS])
-    order = _NON_FIXED_POSITIONS[np.argsort(confidence)]
-    for index in order[:12]:
-        flipped = bits.copy()
-        flipped[index] ^= 1
-        wire = bits_to_bytes(flipped)
-        if wire_crc_valid(wire):
-            return flipped, wire
-    pairs = order[:8]
-    for a in range(len(pairs)):
-        for b in range(a + 1, len(pairs)):
-            flipped = bits.copy()
-            flipped[pairs[a]] ^= 1
-            flipped[pairs[b]] ^= 1
-            wire = bits_to_bytes(flipped)
-            if wire_crc_valid(wire):
-                return flipped, wire
-    for a in range(len(pairs)):
-        for b in range(a + 1, len(pairs)):
-            for c in range(b + 1, len(pairs)):
-                flipped = bits.copy()
-                flipped[pairs[a]] ^= 1
-                flipped[pairs[b]] ^= 1
-                flipped[pairs[c]] ^= 1
-                wire = bits_to_bytes(flipped)
-                if wire_crc_valid(wire):
-                    return flipped, wire
-    return None
-
-
 def _decide(
     features: np.ndarray,
     thresholds: np.ndarray,
@@ -338,11 +311,6 @@ def _decide(
     wire = bits_to_bytes(bits)
     fixed_score = int((bits[FIXED_POSITIONS] == FIXED_VALUES).sum())
     crc_valid = wire_crc_valid(wire)
-    if not crc_valid and fixed_score == len(FIXED_POSITIONS):
-        recovered = _confidence_flips(bits, features, thresholds)
-        if recovered is not None:
-            bits, wire = recovered
-            crc_valid = True
     return Candidate(
         start_sample=start,
         period_samples=period,
@@ -612,8 +580,17 @@ def decode_file(path: Path) -> dict[str, Any]:
         raise DecodeError("audio is too short to contain the 3.28-second frame")
     if sample_rate < 15000:
         raise DecodeError("sample rate is too low for the 6.8-kHz FSK band")
-    low_envelope, high_envelope = combined_envelopes(samples, sample_rate)
-    candidate = find_frame(low_envelope, high_envelope, sample_rate)
+    last_error: DecodeError | None = None
+    candidate: Candidate | None = None
+    for low_envelope, high_envelope in envelope_views(samples, sample_rate):
+        try:
+            candidate = find_frame(low_envelope, high_envelope, sample_rate)
+            break
+        except DecodeError as error:
+            last_error = error
+    if candidate is None:
+        assert last_error is not None
+        raise last_error
     payload = wire_to_payload(candidate.wire)
     received_crc = int.from_bytes(candidate.wire[38:40], "big")
 

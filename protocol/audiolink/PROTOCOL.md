@@ -231,11 +231,17 @@ A batch receiver for a captured buffer works as follows:
 1. Compute the band envelopes around 5.5 and 6.8 kHz (analytic envelope via
    band-pass, or quadrature demodulation with a ~±250 Hz low-pass) and the
    normalized discriminator `D`. The sounder is rich in harmonics, so the
-   envelopes of 11 and 16.5 kHz (for `1`) and 13.6 kHz (for `0`) carry the
-   same bit information in bands that everyday interference such as speech
-   rarely reaches; combining each class's bands - normalized per band by a
+   second harmonics at 11 kHz (for `1`) and 13.6 kHz (for `0`) carry the same
+   bit information in bands that everyday interference such as speech rarely
+   reaches; combining the matched harmonic pair - normalized per band by a
    high percentile, and including a harmonic band only when it shows real
-   burst activity - makes the discriminator markedly more robust.
+   burst activity - makes the discriminator markedly more robust. Higher
+   harmonics near typical microphone/codec cutoffs are not mixed in: evidence
+   from an unmatched harmonic order can bias one FSK class.
+   Include the second harmonic only when both FSK classes show activity. If
+   the combined view fails validation, evaluate the matched second-harmonic
+   pair and the fundamental pair separately; this handles interference
+   confined to one range without changing any decided bits.
 2. Keep a prefix sum of `D` so that the mean of `D` over any symbol window
    is available in O(1).
 3. Search jointly over frame start and symbol period (10 ms ± 3 %). Score a
@@ -254,11 +260,9 @@ A batch receiver for a captured buffer works as follows:
    the discriminator across the 3.3 s frame (e.g. from in-band background
    noise), which a single global threshold cannot.
 6. Assemble 41 bytes MSB first; require the prefix, all six markers, and the
-   end marker; extract the payload; accept the frame only if the CRC
-   matches. If all 72 fixed bits match but the CRC fails, up to two of the
-   least confident non-fixed bits (smallest distance to the decision
-   threshold) may be flipped and the CRC re-checked; with a few dozen
-   combinations against a 16-bit CRC, false accepts remain negligible.
+   end marker; extract the payload; accept the frame only if the CRC matches.
+   The CRC is used strictly for validation, never to choose or flip payload
+   bits. A structurally plausible frame with a failing CRC is discarded.
 
 A live receiver additionally keeps a rolling buffer of at least 12 s (frame
 plus lead-in/lead-out plus margin) and repeats the batch search every few

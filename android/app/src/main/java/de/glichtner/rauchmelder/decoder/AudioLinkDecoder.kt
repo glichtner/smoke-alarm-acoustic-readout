@@ -72,35 +72,52 @@ object AudioLinkDecoder {
 
     // The loud piezo sounder is rich in harmonics, which carry the same bit
     // information in bands that everyday interference (speech, sibilants)
-    // rarely reaches. Fundamentals are always used; a harmonic band joins
-    // only when it shows real activity, so clean or band-limited signals are
-    // unaffected.
-    private val ONE_BANDS_HZ = doubleArrayOf(5500.0, 11000.0, 16500.0)
+    // rarely reaches. Use matched harmonic orders for both FSK classes: an
+    // extra harmonic on only one side can turn high-frequency interference
+    // into a systematic bit bias. Higher orders near microphone/codec cutoffs
+    // are deliberately excluded.
+    private val ONE_BANDS_HZ = doubleArrayOf(5500.0, 11000.0)
     private val ZERO_BANDS_HZ = doubleArrayOf(6800.0, 13600.0)
 
+    private class BandEvidence(val normalized: FloatArray, val active: Boolean)
+
+    /** Normalized evidence for one band plus a conservative burst-activity flag. */
+    private fun bandEvidence(samples: FloatArray, sampleRate: Int, center: Double): BandEvidence {
+        val envelope = envelope(samples, sampleRate, center)
+        val sorted = DoubleArray(envelope.size) { envelope[it].toDouble() }.also { it.sort() }
+        val p95 = percentileOfSorted(sorted, 95.0)
+        val p25 = percentileOfSorted(sorted, 25.0)
+        val scale = max(p95, 1e-12)
+        for (i in envelope.indices) envelope[i] = (envelope[i] / scale).toFloat()
+        return BandEvidence(envelope, p95 > 4.0 * p25)
+    }
+
+    private fun addEvidence(first: FloatArray, second: FloatArray): FloatArray =
+        FloatArray(first.size) { first[it] + second[it] }
+
     /**
-     * Per-class envelope evidence combined over fundamental and harmonics.
-     * Each band is normalized by its 95th percentile; a harmonic band is used
-     * only when that percentile exceeds four times its 25th percentile (i.e.
-     * the band contains bursts rather than a flat noise floor).
+     * A small, predetermined set of matched FSK evidence views. The harmonic
+     * pair joins the primary view only when both classes show activity. The
+     * individual matched pairs are conservative fallbacks for band-confined
+     * interference; every view still requires exact framing and CRC.
      */
-    private fun combinedEnvelope(samples: FloatArray, sampleRate: Int, bands: DoubleArray): FloatArray {
-        var result: FloatArray? = null
-        for ((index, center) in bands.withIndex()) {
-            if (center + 250.0 >= sampleRate / 2.0) continue
-            val env = envelope(samples, sampleRate, center)
-            val sorted = DoubleArray(env.size) { env[it].toDouble() }.also { it.sort() }
-            val p95 = percentileOfSorted(sorted, 95.0)
-            val p25 = percentileOfSorted(sorted, 25.0)
-            if (index > 0 && p95 <= 4.0 * p25) continue
-            val scale = max(p95, 1e-12)
-            if (result == null) {
-                result = FloatArray(env.size) { (env[it] / scale).toFloat() }
-            } else {
-                for (i in env.indices) result[i] += (env[i] / scale).toFloat()
+    private fun evidenceViews(samples: FloatArray, sampleRate: Int): List<Pair<FloatArray, FloatArray>> {
+        val oneFundamental = bandEvidence(samples, sampleRate, ONE_BANDS_HZ[0]).normalized
+        val zeroFundamental = bandEvidence(samples, sampleRate, ZERO_BANDS_HZ[0]).normalized
+        val views = ArrayList<Pair<FloatArray, FloatArray>>()
+        if (ONE_BANDS_HZ.size > 1 && ZERO_BANDS_HZ.size > 1) {
+            val oneHarmonic = bandEvidence(samples, sampleRate, ONE_BANDS_HZ[1])
+            val zeroHarmonic = bandEvidence(samples, sampleRate, ZERO_BANDS_HZ[1])
+            if (oneHarmonic.active && zeroHarmonic.active) {
+                views.add(
+                    addEvidence(oneFundamental, oneHarmonic.normalized) to
+                        addEvidence(zeroFundamental, zeroHarmonic.normalized),
+                )
+                views.add(oneHarmonic.normalized to zeroHarmonic.normalized)
             }
         }
-        return result ?: FloatArray(samples.size)
+        views.add(oneFundamental to zeroFundamental)
+        return views
     }
 
     /** Decodes a mono sample array; null if no CRC-valid frame was found. */
@@ -108,9 +125,9 @@ object AudioLinkDecoder {
         if (sampleRate < 15000) return null
         if (samples.size < sampleRate * 3) return null
 
-        val lowEnv = combinedEnvelope(samples, sampleRate, ONE_BANDS_HZ)
-        val highEnv = combinedEnvelope(samples, sampleRate, ZERO_BANDS_HZ)
-        val candidate = findFrame(lowEnv, highEnv, sampleRate) ?: return null
+        val candidate = evidenceViews(samples, sampleRate).firstNotNullOfOrNull { (lowEnv, highEnv) ->
+            findFrame(lowEnv, highEnv, sampleRate)
+        } ?: return null
         val payload = wireToPayload(candidate.wire)
         return DecodeResult(
             wire = candidate.wire,
@@ -210,10 +227,6 @@ object AudioLinkDecoder {
     private val END_ONE_BITS = intArrayOf(0, 2, 4, 6) // 0xAA = 10101010
     private val END_ZERO_BITS = intArrayOf(1, 3, 5, 7)
 
-    private val fixedBitSet = BooleanArray(FRAME_BITS).also { set ->
-        for (position in fixedBitPositions) set[position] = true
-    }
-
     /**
      * Per-symbol decision thresholds anchored at the known marker bytes: each
      * 0x72 marker and the closing 0xAA contain four known one and four known
@@ -267,50 +280,6 @@ object AudioLinkDecoder {
         return wire
     }
 
-    /**
-     * Confidence-guided recovery for a structurally valid frame whose CRC
-     * fails: flip up to two of the least confident non-fixed bits (smallest
-     * distance to the decision threshold) and accept the first combination
-     * whose CRC matches. With the 72 fixed bits already exact and only a few
-     * dozen combinations tried against a 16-bit CRC, false accepts are
-     * negligible.
-     */
-    private fun confidenceFlips(bits: ByteArray, features: DoubleArray, thresholds: DoubleArray): ByteArray? {
-        val order = (0 until FRAME_BITS)
-            .filter { !fixedBitSet[it] }
-            .sortedBy { abs(features[it] - thresholds[it]) }
-        val singles = order.take(12)
-        for (i in singles) {
-            val flipped = bits.clone()
-            flipped[i] = (1 - flipped[i]).toByte()
-            val wire = bitsToWire(flipped)
-            if (wireCrcValid(wire)) return wire
-        }
-        val pairs = order.take(8)
-        for (a in pairs.indices) {
-            for (b in a + 1 until pairs.size) {
-                val flipped = bits.clone()
-                flipped[pairs[a]] = (1 - flipped[pairs[a]]).toByte()
-                flipped[pairs[b]] = (1 - flipped[pairs[b]]).toByte()
-                val wire = bitsToWire(flipped)
-                if (wireCrcValid(wire)) return wire
-            }
-        }
-        for (a in pairs.indices) {
-            for (b in a + 1 until pairs.size) {
-                for (c in b + 1 until pairs.size) {
-                    val flipped = bits.clone()
-                    flipped[pairs[a]] = (1 - flipped[pairs[a]]).toByte()
-                    flipped[pairs[b]] = (1 - flipped[pairs[b]]).toByte()
-                    flipped[pairs[c]] = (1 - flipped[pairs[c]]).toByte()
-                    val wire = bitsToWire(flipped)
-                    if (wireCrcValid(wire)) return wire
-                }
-            }
-        }
-        return null
-    }
-
     private fun candidateFromThresholds(
         features: DoubleArray,
         thresholds: DoubleArray,
@@ -325,14 +294,8 @@ object AudioLinkDecoder {
         for (i in fixedBitPositions.indices) {
             if (bits[fixedBitPositions[i]] == fixedBitValues[i]) fixedScore++
         }
-        var wire = bitsToWire(bits)
-        var crcValid = wireCrcValid(wire)
-        if (!crcValid && fixedScore == fixedBitPositions.size) {
-            confidenceFlips(bits, features, thresholds)?.let {
-                wire = it
-                crcValid = true
-            }
-        }
+        val wire = bitsToWire(bits)
+        val crcValid = wireCrcValid(wire)
         return Candidate(
             startSample = start.toDouble(),
             periodSamples = period,

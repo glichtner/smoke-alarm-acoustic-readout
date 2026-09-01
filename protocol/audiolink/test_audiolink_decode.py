@@ -3,8 +3,12 @@ import unittest
 import wave
 from pathlib import Path
 
+import numpy as np
+
 from audiolink_decode import (
+    FIXED_POSITIONS,
     DecodeError,
+    _decide,
     canonical_frame,
     crc_ccitt_false,
     decode_fields,
@@ -47,6 +51,20 @@ class AudioLinkDecoderTests(unittest.TestCase):
         self.assertEqual(crc_ccitt_false(wire_to_payload(FRAME_A_WIRE)), 0x4B02)
         self.assertEqual(crc_ccitt_false(wire_to_payload(FRAME_B_WIRE)), 0x9107)
 
+    def test_crc_is_not_used_to_repair_an_uncertain_payload_bit(self) -> None:
+        bits = np.unpackbits(np.frombuffer(FRAME_A_WIRE, dtype=np.uint8))
+        features = np.where(bits == 1, 1.0, -1.0)
+        # Byte 3 is payload, and this transmitted one is made slightly more
+        # zero-like than one-like. Framing remains perfect, but the CRC fails.
+        features[3 * 8 + 1] = -1e-6
+        candidate = _decide(
+            features, np.zeros(len(features)), start=0.0, period=480.0,
+            low=-1.0, high=1.0,
+        )
+        self.assertEqual(candidate.fixed_score, len(FIXED_POSITIONS))
+        self.assertFalse(candidate.crc_valid)
+        self.assertNotEqual(candidate.wire, FRAME_A_WIRE)
+
     def test_app_canonical_normalization(self) -> None:
         frame = canonical_frame(FRAME_A_WIRE)
         self.assertEqual(len(frame), 34)
@@ -82,6 +100,7 @@ class AudioLinkDecoderTests(unittest.TestCase):
             # voice-memo recordings, two per detector; the harmonic bands are
             # needed for some of them
             (root / "Sprache 260901_185243.m4a", "01a55d9b", "36a2"),
+            (root / "Sprache 260901_185256.m4a", "01a55d9b", "23c4"),
             (root / "Sprache 260901_185405.m4a", "01a55d95", "2ebf"),
             (root / "Sprache 260901_185420.m4a", "01a55d95", "2ebf"),
             (root / "Sprache 260901_185716.m4a", "01a55d96", "308e"),
@@ -98,6 +117,16 @@ class AudioLinkDecoderTests(unittest.TestCase):
                 self.assertEqual(result["crc"]["received_hex"], crc)
                 self.assertTrue(result["crc"]["valid"])
                 self.assertEqual(result["framing_score"], "72/72")
+
+    def test_heavily_corrupted_recording_is_rejected(self) -> None:
+        path = (
+            Path(__file__).resolve().parent.parent.parent
+            / "data" / "Sprache 260901_185934.m4a"
+        )
+        if not path.exists():
+            self.skipTest("corrupted regression recording is not present")
+        with self.assertRaises(DecodeError):
+            decode_file(path)
 
 
 if __name__ == "__main__":

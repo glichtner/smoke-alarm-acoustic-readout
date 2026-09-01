@@ -79,19 +79,26 @@ class FieldDecodingTest {
 class EndToEndDecodeTest {
 
     /** Synthesizes the FSK signal of a wire frame (1 = 5.5 kHz, 0 = 6.8 kHz, 10 ms/bit). */
-    private fun synthesize(wire: ByteArray, sampleRate: Int): FloatArray {
+    private fun synthesize(
+        wire: ByteArray,
+        sampleRate: Int,
+        wrongBit: Int? = null,
+    ): FloatArray {
         val symbolSamples = sampleRate / 100
         val lead = sampleRate // 1 s of silence before
         val tail = sampleRate // 1 s of silence after
         val samples = FloatArray(lead + wire.size * 8 * symbolSamples + tail)
         var index = lead
+        var symbol = 0
         for (byte in wire) {
             for (bit in 7 downTo 0) {
                 val one = (byte.toInt() shr bit) and 1 == 1
-                val freq = if (one) 5500.0 else 6800.0
                 for (i in 0 until symbolSamples) {
+                    val transmittedOne = if (symbol == wrongBit) !one else one
+                    val freq = if (transmittedOne) 5500.0 else 6800.0
                     samples[index++] = (0.5 * sin(2.0 * PI * freq * i / sampleRate)).toFloat()
                 }
+                symbol++
             }
         }
         return samples
@@ -159,6 +166,13 @@ class EndToEndDecodeTest {
     fun rejectsPureNoise() {
         val random = java.util.Random(7)
         val samples = FloatArray(48000 * 6) { (random.nextGaussian() * 0.2).toFloat() }
+        assertNull(AudioLinkDecoder.decode(samples, 48000))
+    }
+
+    @Test
+    fun rejectsCrcFailingPayloadBitInsteadOfRepairingIt() {
+        // Byte 3 is payload; bit offset 1 is a transmitted one in frame A.
+        val samples = synthesize(WIRE_FRAME_A, 48000, wrongBit = 3 * 8 + 1)
         assertNull(AudioLinkDecoder.decode(samples, 48000))
     }
 }

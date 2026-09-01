@@ -2,7 +2,7 @@ package de.glichtner.rauchmelder.decoder
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
-import org.junit.Assert.assertTrue
+import org.junit.Assert.assertNull
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
@@ -83,10 +83,9 @@ class RealRecordingTest {
 
     /**
      * Recordings 5-12 are voice-memo captures, two per detector (four further
-     * detectors). The first capture of each pair must decode; a second,
-     * heavily corrupted capture may fail, but must never yield a different
-     * ID than its pair - a wrong ID would silently register a phantom
-     * detector.
+     * detectors). The first three pairs are recoverable without changing any
+     * decided bit. Recording 12 is too damaged and must remain rejected; a
+     * wrong ID would silently register a phantom detector.
      */
     @Test
     fun recordingPairsYieldConsistentIds() {
@@ -97,18 +96,22 @@ class RealRecordingTest {
             Triple("audiolink-11.wav", "audiolink-12.wav", "01a55d98"),
         )
         var decoded = 0
-        for ((first, second, id) in pairs) {
+        for ((pairIndex, pair) in pairs.withIndex()) {
+            val (first, second, id) = pair
             val resultA = decode(first)
             assertNotNull("$first not decoded", resultA)
             assertEquals(id, resultA!!.fields.alarmId)
             decoded++
             val resultB = decode(second)
-            if (resultB != null) {
-                assertEquals("$second decoded with a wrong ID", id, resultB.fields.alarmId)
+            if (pairIndex < 3) {
+                assertNotNull("$second not decoded", resultB)
+                assertEquals("$second decoded with a wrong ID", id, resultB!!.fields.alarmId)
                 decoded++
+            } else {
+                assertNull("$second is too corrupted and must be rejected", resultB)
             }
         }
-        assertTrue("expected at least 6 of 8 pair recordings to decode", decoded >= 6)
+        assertEquals("expected exactly the seven unambiguous recordings", 7, decoded)
     }
 
     @Test
